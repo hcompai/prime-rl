@@ -14,6 +14,7 @@ def transformers_v5_compat():
         Qwen3VLMoeTextConfig.tie_word_embeddings = False
 
     _patch_qwen35_lora()
+    _patch_peft_helper_fuse_polling()
     _patch_lora_key_prefix()
     monkey_patch_deep_gemm_ep_scatter()
     monkey_patch_dp_engine_core_pause_resume_deadlock()
@@ -226,6 +227,87 @@ def _patch_qwen35_lora():
         ]
 
     MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a
+
+
+def _patch_peft_helper_fuse_polling():
+    """Poll for adapter_config.json on an FS-backed LoRA dir before reading it.
+
+    vLLM's LoRA load path runs PEFTHelper.from_local_dir (which reads
+    ``adapter_config.json`` with a raw ``open``) before LoRAModel.from_local_checkpoint
+    (which reads ``adapter_model.safetensors``). On a cache-cold rclone S3 mount,
+    the trainer's just-written adapter_config.json isn't yet visible on the
+    inference side, ``open`` raises FileNotFoundError, and vLLM converts that
+    into a permanent LoRAAdapterNotFoundError — the LoRA never loads and RL
+    silently serves the base model from then on.
+
+    Wrap from_local_dir to force ``os.listdir(lora_path)`` and retry the read
+    with bounded backoff (10 minute budget, same as the safetensors poll).
+    Tensorizer path (remote stream) is delegated to its own loader unchanged.
+    """
+    import json as _json
+    import logging as _logging
+    import os as _os
+    import time as _time
+
+    from vllm.lora.peft_helper import PEFTHelper, TensorizerConfig
+
+    _fuse_logger = _logging.getLogger("prime_rl.inference.peft_config_load")
+
+    @classmethod
+    def _patched_from_local_dir(
+        cls,
+        lora_path: str,
+        max_position_embeddings: int | None,
+        tensorizer_config_dict: dict | None = None,
+    ) -> "PEFTHelper":
+        lora_config_path = _os.path.join(lora_path, "adapter_config.json")
+
+        if tensorizer_config_dict:
+            tensorizer_config = TensorizerConfig(**tensorizer_config_dict)
+            tensorizer_args = tensorizer_config._construct_tensorizer_args()
+            from tensorizer.stream_io import open_stream
+
+            lora_config_path = _os.path.join(tensorizer_config.tensorizer_dir, "adapter_config.json")
+            with open_stream(lora_config_path, mode="rb", **tensorizer_args.stream_kwargs) as f:
+                config = _json.load(f)
+        else:
+            deadline = _time.monotonic() + 600.0
+            sleep_s = 1.0
+            started = _time.monotonic()
+            config = None
+            while _time.monotonic() < deadline:
+                try:
+                    _os.listdir(lora_path)
+                except OSError:
+                    pass
+                try:
+                    with open(lora_config_path) as f:
+                        config = _json.load(f)
+                    waited = _time.monotonic() - started
+                    if waited > 0.5:
+                        _fuse_logger.info(
+                            "adapter_config.json readable at %s after %.1fs FUSE wait",
+                            lora_config_path,
+                            waited,
+                        )
+                    break
+                except FileNotFoundError:
+                    _fuse_logger.warning(
+                        "adapter_config.json not yet visible at %s (waited %.1fs); refreshing rclone dir cache",
+                        lora_config_path,
+                        _time.monotonic() - started,
+                    )
+                    _time.sleep(sleep_s)
+                    sleep_s = min(sleep_s * 1.5, 10.0)
+            if config is None:
+                raise FileNotFoundError(
+                    f"adapter_config.json never appeared at {lora_config_path} within 600s FUSE polling budget"
+                )
+
+        config["vllm_max_position_embeddings"] = max_position_embeddings
+        return cls.from_dict(config)
+
+    PEFTHelper.from_local_dir = _patched_from_local_dir
 
 
 def _patch_lora_key_prefix():
