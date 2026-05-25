@@ -1097,7 +1097,13 @@ def setup_model(
 
 def _get_qwen3_vl_mm_token_type_ids(model: nn.Module, input_ids: Tensor) -> Tensor | None:
     config = getattr(model, "config", None)
-    if getattr(config, "model_type", None) != "qwen3_vl":
+    # Qwen3.5-VL ships with model_type="qwen3_5" but shares the same
+    # mm_token_type_ids convention as Qwen3-VL (image_token_id -> 1,
+    # video_token_id -> 2). Without including it here,
+    # compute_3d_position_ids dies on the first M-RoPE forward with
+    # ``ValueError: Multimodal data was passed (via image_grid_thw or
+    # video_grid_thw) but mm_token_type_ids is missing``.
+    if getattr(config, "model_type", None) not in ("qwen3_vl", "qwen3_5"):
         return None
 
     mm_token_type_ids = torch.zeros_like(input_ids)
