@@ -306,13 +306,59 @@ async def check_health(
 NCCL_READY_MARKER = "NCCL_READY"
 
 
+def _is_retryable_admin_call_error(exception: BaseException) -> bool:
+    """Transient HTTP/network errors on the NCCL admin endpoints.
+
+    These manifest as ``httpx.RemoteProtocolError: Server disconnected without
+    sending a response`` on a keepalive-reused connection — vLLM's uvicorn
+    closed the idle keepalive between our pool's last use and this admin
+    call, so the POST landed on a half-closed socket and the request never
+    reached vLLM.
+
+    Since the request was never accepted, retry is safe for all three
+    endpoints (/pause, /resume, /update_weights). We deliberately do NOT
+    retry HTTPStatusError: a 5xx after the request was accepted may mean
+    vLLM is mid-state-change (paused, mid-NCCL), and a blind retry could
+    double-pause or deadlock.
+    """
+    return isinstance(
+        exception,
+        (
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.ConnectTimeout,
+        ),
+    )
+
+
+# 4 attempts, exponential 1-8s — total ~15s, well below the trainer-side
+# NCCL barrier timeout, so even all-4 retries won't deadlock the broadcast.
+_ADMIN_RETRY = retry(
+    retry=retry_if_exception(_is_retryable_admin_call_error),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    reraise=True,
+)
+
+
 async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
     """Pause all inference engines, waiting for in-flight requests to drain."""
     logger = get_logger()
     logger.info("Pausing inference engines for weight update")
 
+    @_ADMIN_RETRY
     async def _pause(client: AsyncClient) -> None:
-        response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
+        # ``Connection: close`` disables keepalive on this specific request,
+        # eliminating the reused-socket race that killed multi-step runs
+        # when vLLM closed an idle keepalive between rollouts and the next
+        # /pause and httpx then reused the half-closed socket.
+        response = await client.post(
+            "/pause",
+            params={"mode": "keep", "clear_cache": "false"},
+            headers={"Connection": "close"},
+        )
         response.raise_for_status()
 
     await asyncio.gather(*[_pause(client) for client in admin_clients])
@@ -323,8 +369,9 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     """Resume all inference engines after weight update."""
     logger = get_logger()
 
+    @_ADMIN_RETRY
     async def _resume(client: AsyncClient) -> None:
-        response = await client.post("/resume")
+        response = await client.post("/resume", headers={"Connection": "close"})
         response.raise_for_status()
 
     await asyncio.gather(*[_resume(client) for client in admin_clients])
@@ -354,8 +401,13 @@ async def update_weights(
         await load_lora_adapter(admin_clients, lora_name, weight_dir)
     else:
 
+        @_ADMIN_RETRY
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
-            response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir})
+            response = await admin_client.post(
+                "/update_weights",
+                json={"weight_dir": weight_dir},
+                headers={"Connection": "close"},
+            )
             response.raise_for_status()
 
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
