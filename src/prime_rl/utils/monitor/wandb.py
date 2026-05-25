@@ -1,10 +1,11 @@
+import importlib
 import json
 import os
 import random
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import verifiers as vf
 import wandb
@@ -12,7 +13,6 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 from wandb.errors import CommError
 from wandb.sdk.mailbox.mailbox_handle import ServerResponseError
 
-from hai_desktop_env.trace_render import render_rollout_html
 from prime_rl.configs.shared import WandbConfig, WandbWithExtrasConfig
 from prime_rl.utils.chat_template import deserialize_tool_calls
 from prime_rl.utils.config import BaseConfig
@@ -301,10 +301,34 @@ class WandbMonitor(Monitor):
             json.dump(wandb.summary._as_dict(), f)
 
 
+# PATCH: resolve a renderer lazily from PRIME_RL_TRACE_RENDERER="module.path:func". Returning None
+# disables HTML rendering (the trace_html column stays empty) without crashing the monitor.
+_TRACE_RENDERER_CACHE: tuple[str | None, Callable[[vf.RolloutOutput], str] | None] = (None, None)
+
+
+def _get_trace_renderer(logger: Any) -> Callable[[vf.RolloutOutput], str] | None:
+    global _TRACE_RENDERER_CACHE
+    spec = os.environ.get("PRIME_RL_TRACE_RENDERER") or None
+    if _TRACE_RENDERER_CACHE[0] == spec:
+        return _TRACE_RENDERER_CACHE[1]
+    fn: Callable[[vf.RolloutOutput], str] | None = None
+    if spec:
+        try:
+            module_path, _, attr = spec.partition(":")
+            fn = getattr(importlib.import_module(module_path), attr)
+        except Exception as e:
+            logger.warning(f"PRIME_RL_TRACE_RENDERER={spec!r} could not be resolved: {e}")
+    _TRACE_RENDERER_CACHE = (spec, fn)
+    return fn
+
+
 # PATCH: render one rollout to wandb.Html, swallowing render errors so the trace column never breaks the table.
 def _safe_render_html(rollout: vf.RolloutOutput, logger: Any) -> wandb.Html | None:
+    renderer = _get_trace_renderer(logger)
+    if renderer is None:
+        return None
     try:
-        return wandb.Html(render_rollout_html(rollout))
+        return wandb.Html(renderer(rollout))
     except Exception as e:
         logger.warning(f"Trace HTML render failed for example_id={rollout.get('example_id')}: {e}")
         return None
