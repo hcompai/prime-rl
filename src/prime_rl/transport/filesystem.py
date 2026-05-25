@@ -1,5 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import time
+
+import msgspec
 
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.transport.base import MicroBatchReceiver, MicroBatchSender, TrainingBatchReceiver, TrainingBatchSender
@@ -125,17 +128,42 @@ class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
             del self._received_steps[idx]
 
 
+def _encode_and_write_rank(
+    micro_batches: list[MicroBatch],
+    step_path: Path,
+    data_rank: int,
+) -> None:
+    """Encode + atomically write a single rank's micro batches.
+
+    Runs in a worker thread; uses the same ``.tmp → final`` atomic rename
+    as the serial implementation so trainer-side readers never observe
+    partial files.
+
+    A fresh ``msgspec.msgpack.Encoder`` is instantiated per call rather
+    than sharing the sender's encoder: msgspec encoders keep a per-instance
+    internal buffer that is not safe to share across threads.
+    """
+    encoder = msgspec.msgpack.Encoder()
+    buffer = encoder.encode(micro_batches)
+    tmp_path = step_path / f"rank_{data_rank}.bin.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(buffer)
+    tmp_path.rename(step_path / f"rank_{data_rank}.bin")
+
+
 class FileSystemMicroBatchSender(MicroBatchSender):
-    """Filesystem-based micro batch sender that writes micro batches to disk."""
+    """Filesystem-based micro batch sender that writes micro batches to disk in parallel."""
 
     def __init__(self, output_dir: Path, data_world_size: int, current_step: int = 0):
         super().__init__(output_dir, data_world_size)
         self.rollout_dir = get_rollout_dir(output_dir)
         self.current_step = current_step
+        # Cap at 32 workers: beyond that extra threads contend on the FUSE
+        # inode lock and stop helping. Typical data_world_size is 16-64.
+        self._max_workers = min(32, max(1, data_world_size))
 
     def send(self, micro_batch_grid: list[list[MicroBatch]]) -> None:
-        """Send grid of micro batches to the trainers."""
-        # Validation
+        """Send grid of micro batches to the trainers in parallel."""
         assert len(micro_batch_grid) == self.data_world_size, "Number of micro batch lists must match data world size"
         for micro_batch_list in micro_batch_grid:
             assert len(micro_batch_list) == len(micro_batch_grid[0]), "All micro batch lists must have the same length"
@@ -143,12 +171,14 @@ class FileSystemMicroBatchSender(MicroBatchSender):
         step_path = get_step_path(self.rollout_dir, self.current_step)
         step_path.mkdir(parents=True, exist_ok=True)
 
-        for data_rank in range(self.data_world_size):
-            buffer = self.encoder.encode(micro_batch_grid[data_rank])
-            tmp_path = step_path / f"rank_{data_rank}.bin.tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(buffer)
-            tmp_path.rename(step_path / f"rank_{data_rank}.bin")
+        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            futures = [
+                pool.submit(_encode_and_write_rank, micro_batch_grid[data_rank], step_path, data_rank)
+                for data_rank in range(self.data_world_size)
+            ]
+            for fut in futures:
+                fut.result()
+
         self.current_step += 1
 
 
