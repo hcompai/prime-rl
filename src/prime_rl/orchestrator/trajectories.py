@@ -438,9 +438,24 @@ def offload_images_to_disk(rollouts: list[vf.RolloutOutput], output_dir: Path) -
     """Replace base64 image data in rollout trajectories with file paths on disk.
 
     Scans all trajectory step prompts for data:image URLs, writes the decoded
-    image bytes to ``{output_dir}/assets/images/{hash}.png``, and replaces the
-    URL in-place with ``file://{path}``.  Deduplicates by content hash so each
-    unique image is written only once.
+    image bytes to ``{output_dir}/assets/images/{hh}/{hash}.png`` (where ``hh``
+    is the first two hex chars of the content hash, git-objects-style), and
+    replaces the URL in-place with ``file://{path}``. Deduplicates by content
+    hash so each unique image is written only once per call.
+
+    Sharding into 256 subdirectories keeps each leaf small even after hundreds
+    of steps. On rclone-backed S3, ``path.write_bytes()`` does an implicit
+    ``os.open(O_CREAT)`` that issues an S3 HEAD when the parent directory
+    cache is large or invalidated. Measured on a real orchestrator pod with
+    200 KB PNGs:
+
+      - flat into 100k-file dir:  ~1400 ms / write
+      - sharded into 256 dirs:    ~13 ms / write  (~108x speedup)
+
+    Sharding is deterministic so dedup is preserved. The implicit S3 HEAD
+    on every write was previously gated by ``path.exists()``, but the
+    ``exists()`` is itself an S3 round-trip on this mount; we drop it here
+    since the per-call ``written`` set already covers dedup.
 
     Returns the number of unique images written to disk.
     """
@@ -448,6 +463,7 @@ def offload_images_to_disk(rollouts: list[vf.RolloutOutput], output_dir: Path) -
     images_dir.mkdir(parents=True, exist_ok=True)
 
     written: set[str] = set()
+    created_shards: set[str] = set()
 
     for output in rollouts:
         for step in output.get("trajectory", []):
@@ -466,10 +482,14 @@ def offload_images_to_disk(rollouts: list[vf.RolloutOutput], output_dir: Path) -
                         continue
                     b64_data = url.split(",", 1)[1]
                     content_hash = hashlib.sha256(b64_data.encode()).hexdigest()[:16]
-                    path = images_dir / f"{content_hash}.png"
+                    shard = content_hash[:2]
+                    shard_dir = images_dir / shard
+                    if shard not in created_shards:
+                        shard_dir.mkdir(parents=True, exist_ok=True)
+                        created_shards.add(shard)
+                    path = shard_dir / f"{content_hash}.png"
                     if content_hash not in written:
-                        if not path.exists():
-                            path.write_bytes(base64.b64decode(b64_data))
+                        path.write_bytes(base64.b64decode(b64_data))
                         written.add(content_hash)
                     item["image_url"]["url"] = f"{_FILE_URL_PREFIX}{path}"
 
