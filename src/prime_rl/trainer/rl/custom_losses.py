@@ -17,8 +17,9 @@ from typing import Any
 
 import torch
 from jaxtyping import Bool
-from prime_rl.trainer.rl.loss import LossInputs, LossOutputs
 from torch import Tensor
+
+from prime_rl.trainer.rl.loss import LossInputs, LossOutputs
 
 
 def _safe_mean(t: Tensor, m: Bool[Tensor, " seq"]) -> Tensor:  # noqa: F722
