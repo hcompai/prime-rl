@@ -358,8 +358,23 @@ async def update_weights(
 def _is_retryable_lora_error(exception: BaseException) -> bool:
     """Check if an exception should trigger a retry for LoRA loading."""
     if isinstance(exception, httpx.HTTPStatusError):
+        status = exception.response.status_code
         # Retry on 404 (adapter not found) or 500 (server error during loading)
-        return exception.response.status_code in (404, 500)
+        if status in (404, 500):
+            return True
+        # Retry HTTP 400 when caused by FUSE-visibility lag: vLLM raises
+        # ``ValueError("{lora_dir} doesn't contain tensors")`` (surfaced as
+        # HTTP 400) when os.path.isfile for adapter_model.safetensors
+        # returns False because the inference node's FUSE metadata cache
+        # hasn't yet seen the file the trainer just wrote. A short retry
+        # gives the cache time to refresh; all other 400s are still fatal.
+        if status == 400:
+            try:
+                body = exception.response.text
+            except Exception:
+                body = ""
+            return "doesn't contain tensors" in body or "does not contain tensors" in body
+        return False
     # Retry on transport-level failures (timeouts, connection resets, etc.) so
     # the per-call read timeout below turns a stuck server into a bounded retry
     # loop instead of propagating as a hard failure on the first hiccup.
