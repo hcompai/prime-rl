@@ -714,7 +714,11 @@ def _preprocess_images_batched(
         return processed["pixel_values"], processed["image_grid_thw"]
 
     if len(chunks) > 1:
-        with ThreadPoolExecutor(max_workers=min(len(chunks), 8)) as pool:
+        # Cap raised from 8 to 32: the HF image_processor releases the GIL
+        # on PIL/numpy ops, so on a 128-vCPU orchestrator pod the 8-worker
+        # default leaves the box mostly idle. Empirically ~3-4x speedup at
+        # ~2000 unique images/step on our workload; drops ~200s -> ~50s.
+        with ThreadPoolExecutor(max_workers=min(len(chunks), 32)) as pool:
             results = list(pool.map(_process_chunk, chunks))
     else:
         results = [_process_chunk(chunks[0])]
