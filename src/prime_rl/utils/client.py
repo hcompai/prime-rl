@@ -394,8 +394,13 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
 # `_PER_ATTEMPT` converts a hang into a TimeoutException so tenacity retries;
 # `_TOTAL` is the wall-clock budget across all retries — pick whichever
 # stop condition fires first.
-LORA_LOAD_READ_TIMEOUT_S = 30.0
-LORA_LOAD_TOTAL_TIMEOUT_S = 120.0
+#
+# Per-attempt read timeout has to exceed the server-side FUSE-visibility
+# poll budget in inference/patches.py (currently 600s). Otherwise the HTTP
+# read trips before the server's poll finishes, turning a successful slow
+# load into a retryable TimeoutException.
+LORA_LOAD_READ_TIMEOUT_S = 660.0
+LORA_LOAD_TOTAL_TIMEOUT_S = 900.0
 
 
 async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:
@@ -412,8 +417,8 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
 
     @retry(
         retry=retry_if_exception(_is_retryable_lora_error),
-        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S) | stop_after_attempt(10),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S) | stop_after_attempt(30),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
         reraise=True,
     )
     async def _load_lora_adapter(admin_client: AsyncClient) -> None:
