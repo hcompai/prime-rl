@@ -4,7 +4,7 @@ from time import time
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.transport.base import MicroBatchReceiver, MicroBatchSender, TrainingBatchReceiver, TrainingBatchSender
 from prime_rl.transport.types import MicroBatch, TrainingBatch
-from prime_rl.utils.pathing import get_rollout_dir, get_step_path, sync_wait_for_path
+from prime_rl.utils.pathing import _refresh_fuse_parent, get_rollout_dir, get_step_path, sync_wait_for_path
 
 BATCH_FILE_TMP_NAME = "train_rollouts.bin.tmp"
 BATCH_FILE_NAME = "train_rollouts.bin"
@@ -58,9 +58,18 @@ class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
         return get_step_path(rollout_dir, step) / BATCH_FILE_NAME
 
     def can_receive(self) -> bool:
-        """Check if any run has a batch file available."""
+        """Check if any run has a batch file available.
+
+        Forces an ``os.listdir`` on the candidate step dir before each
+        ``exists()`` so rclone's negative-dentry cache doesn't hide a
+        ``train_rollouts.bin`` that the orchestrator has already written.
+        """
         for idx in self.multi_run_manager.used_idxs:
-            if not self.multi_run_manager.ready_to_update[idx] and self._get_batch_path(idx).exists():
+            if self.multi_run_manager.ready_to_update[idx]:
+                continue
+            batch_path = self._get_batch_path(idx)
+            _refresh_fuse_parent(batch_path)
+            if batch_path.exists():
                 return True
         return False
 
@@ -91,6 +100,9 @@ class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
             if self.multi_run_manager.ready_to_update[idx]:
                 continue
             batch_path = self._get_batch_path(idx)
+            # Same FUSE-cache workaround as can_receive(): callers are not
+            # required to poll can_receive() first, so refresh defensively here.
+            _refresh_fuse_parent(batch_path)
             if batch_path.exists():
                 try:
                     with open(batch_path, "rb") as f:
