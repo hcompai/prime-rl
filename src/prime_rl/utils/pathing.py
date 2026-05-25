@@ -1,9 +1,25 @@
 import asyncio
+import os
 import shutil
 import time
 from pathlib import Path
 
 from prime_rl.utils.logger import get_logger
+
+
+def _refresh_fuse_parent(path: Path) -> None:
+    """Force the OS to re-list ``path.parent`` so FUSE invalidates stale dentries.
+
+    On rclone-mounted S3, the kernel's negative-dentry cache can suppress a
+    newly-written file for many seconds (sometimes minutes) after the writer
+    finishes. An ``os.listdir`` on the parent is a single cheap syscall that
+    bypasses rclone's dir cache and refreshes the kernel dcache. Errors are
+    swallowed: the parent may not exist yet, or may momentarily race a creator.
+    """
+    try:
+        os.listdir(path.parent)
+    except OSError:
+        pass
 
 
 def get_log_dir(output_dir: Path) -> Path:
@@ -177,6 +193,7 @@ def sync_wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) ->
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
     while True:
+        _refresh_fuse_parent(path)
         if path.exists():
             logger.debug(f"Found path `{path}`")
             break
@@ -191,6 +208,7 @@ async def wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
     while True:
+        _refresh_fuse_parent(path)
         if path.exists():
             logger.debug(f"Found path `{path}`")
             break
