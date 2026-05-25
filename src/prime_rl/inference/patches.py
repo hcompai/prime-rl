@@ -364,6 +364,49 @@ def _patch_lora_key_prefix():
         lora_bin_file_path = os.path.join(lora_dir, "adapter_model.bin")
         lora_pt_file_path = os.path.join(lora_dir, "adapter_model.pt")
 
+        # Poll for the adapter file to become visible on an rclone-backed
+        # FUSE mount. The trainer writes adapter_model.safetensors to S3 via
+        # rclone, and there is a window (rclone vfs cache flush + dir-cache
+        # TTL on the read side) where os.path.isfile returns False even
+        # though the file is already in S3. Without this poll vLLM raises
+        # ``ValueError(f"{lora_dir} doesn't contain tensors")``, which is
+        # surfaced as a permanent HTTP 400 to the orchestrator. os.listdir
+        # forces rclone to re-stat the dir against S3 and refreshes the
+        # kernel dcache for all entries.
+        import logging as _logging
+        import time as _time
+
+        _fuse_logger = _logging.getLogger("prime_rl.inference.lora_load")
+        deadline = _time.monotonic() + 600.0
+        sleep_s = 1.0
+        started = _time.monotonic()
+        while _time.monotonic() < deadline:
+            try:
+                os.listdir(lora_dir)
+            except OSError:
+                pass
+            if (
+                tensorizer_config_dict
+                or os.path.isfile(lora_tensor_path)
+                or os.path.isfile(lora_bin_file_path)
+                or os.path.isfile(lora_pt_file_path)
+            ):
+                waited = _time.monotonic() - started
+                if waited > 0.5:
+                    _fuse_logger.info(
+                        "LoRA adapter visible at %s after %.1fs FUSE wait",
+                        lora_dir,
+                        waited,
+                    )
+                break
+            _fuse_logger.warning(
+                "LoRA adapter not yet visible at %s (waited %.1fs); refreshing rclone dir cache",
+                lora_dir,
+                _time.monotonic() - started,
+            )
+            _time.sleep(sleep_s)
+            sleep_s = min(sleep_s * 1.5, 10.0)
+
         tensors: dict[str, torch.Tensor] = {}
         unexpected_modules: list[list[str] | str] = []
 
