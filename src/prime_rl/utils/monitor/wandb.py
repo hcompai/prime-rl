@@ -51,7 +51,10 @@ class WandbMonitor(Monitor):
         self._maybe_overwrite_wandb_command()
 
         # PATCH: WANDB_MODE=disabled/offline must override shared mode (shared mode requires a server connection).
-        shared_mode = os.environ.get("WANDB_SHARED_MODE") == "1" and os.environ.get("WANDB_MODE") not in ("disabled", "offline")
+        shared_mode = os.environ.get("WANDB_SHARED_MODE") == "1" and os.environ.get("WANDB_MODE") not in (
+            "disabled",
+            "offline",
+        )
         if shared_mode:
             run_id = os.environ.get("WANDB_SHARED_RUN_ID")
             label = os.environ.get("WANDB_SHARED_LABEL")
