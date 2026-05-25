@@ -38,8 +38,9 @@ from __future__ import annotations
 
 import torch
 from jaxtyping import Float
-from prime_rl.orchestrator.advantage import AdvantageInputs, AdvantageOutputs
 from torch import Tensor
+
+from prime_rl.orchestrator.advantage import AdvantageInputs, AdvantageOutputs
 
 
 def positive_only_advantage_fn(
