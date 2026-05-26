@@ -250,6 +250,22 @@ def train(config: SFTConfig):
         target_ids = micro_batch["target_ids"].to("cuda")
         loss_mask = micro_batch["loss_mask"].to("cuda")
 
+        # Multimodal tensors: move to CUDA verbatim (see ``forward()`` in
+        # ``trainer/model.py`` for the contract — kwargs are ``**``-unpacked
+        # into the model's HF forward, ``mm_token_type_ids`` is split out).
+        mm_kwargs_raw = micro_batch.get("mm_kwargs")
+        mm_kwargs = {k: v.to("cuda") for k, v in mm_kwargs_raw.items()} if mm_kwargs_raw else None
+        mm_token_type_ids = (
+            micro_batch["mm_token_type_ids"].to("cuda") if micro_batch.get("mm_token_type_ids") is not None else None
+        )
+
+        # Mirror the RL trainer's CP + VLM guard (see ``trainer/rl/train.py``):
+        # MRoPE in Qwen3-VL etc. requires global positions, and CP shards the
+        # sequence. Lifting this is Phase 2 (Ulysses-only first, then ring CP
+        # via pre-computed 3D positions).
+        if cp_enabled and mm_kwargs is not None:
+            raise NotImplementedError("Context parallelism is not supported with VLM/multimodal training")
+
         if cp_enabled:
             input_ids, position_ids = setup_cp_params(
                 input_ids, position_ids, cp_rank, cp_size, cp_group, cp_style=config.model.cp_style
@@ -266,10 +282,23 @@ def train(config: SFTConfig):
             if config.loss_impl in ("liger_fused", "quack_fused"):
                 masked_target_ids = target_ids.clone()
                 masked_target_ids[~loss_mask] = FUSED_CE_IGNORE_INDEX
-                out = forward(model, input_ids, position_ids, labels=masked_target_ids)
+                out = forward(
+                    model,
+                    input_ids,
+                    position_ids,
+                    labels=masked_target_ids,
+                    mm_kwargs=mm_kwargs,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
                 loss_sum = out["loss"] * token_count
             else:
-                out = forward(model, input_ids, position_ids)
+                out = forward(
+                    model,
+                    input_ids,
+                    position_ids,
+                    mm_kwargs=mm_kwargs,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
                 logits = out["logits"]
                 B, L, V = logits.shape
                 token_loss = ce_loss(logits.view(-1, V), target_ids.view(-1)).view(B, L)

@@ -27,18 +27,30 @@ from prime_rl.utils.logger import get_logger
 STACKING_DATASET_BUCKET_TIMEOUT = 10
 
 
-class Sample(TypedDict):
+class Sample(TypedDict, total=False):
     input_ids: list[int]
     position_ids: list[int]
     loss_mask: list[bool]
     target_ids: list[int]
 
+    # Optional multimodal fields. Absent for text-only samples; populated by a
+    # VLM-aware dataset (Phase 1). Mirrors the RL ``TensorMicroBatch`` contract
+    # (see ``trainer/rl/data.py``): ``mm_kwargs`` is a flat dict matching the
+    # model's HF forward signature (e.g. ``pixel_values``, ``image_grid_thw``
+    # for Qwen3-VL), and ``mm_token_type_ids`` is renderer-supplied per-token
+    # modality ids (0=text, 1=image, 2=video).
+    mm_kwargs: dict[str, Tensor] | None
+    mm_token_type_ids: list[int] | None
 
-class Batch(TypedDict):
+
+class Batch(TypedDict, total=False):
     input_ids: Int[Tensor, "batch seq"]
     position_ids: Int[Tensor, "batch seq"]
     target_ids: Int[Tensor, "batch seq"]
     loss_mask: Bool[Tensor, "batch seq"]
+
+    mm_kwargs: dict[str, Tensor] | None
+    mm_token_type_ids: Int[Tensor, "batch seq"] | None
 
 
 class StatefulIterableDataset(Stateful, IterableDataset):
@@ -360,6 +372,12 @@ class CatDataset(StatefulIterableDataset):
     def __iter__(self):
         packed_samples, seq_len = defaultdict(list), 0
         for sample in self.dataset:
+            if sample.get("mm_kwargs") is not None or sample.get("mm_token_type_ids") is not None:
+                raise NotImplementedError(
+                    "Multimodal samples are not yet supported by CatDataset packing. "
+                    "Document-aware VLM packing is Phase 1; use a non-packing dataloader "
+                    "(or a VLM-specific dataset class) for now."
+                )
             # Add sample to packed samples
             for key, value in sample.items():
                 assert isinstance(value, list), f"Value for key {key} must be a list"
@@ -411,6 +429,12 @@ class StackDataset(StatefulIterableDataset):
 
     def __iter__(self):
         for sample in self.dataset:
+            if sample.get("mm_kwargs") is not None or sample.get("mm_token_type_ids") is not None:
+                raise NotImplementedError(
+                    "Multimodal samples are not yet supported by StackDataset bucketing. "
+                    "Padding pixel_values / mm_token_type_ids across bucket samples is "
+                    "Phase 1 work; use a non-packing dataloader for VLM samples."
+                )
             # Truncate sample if it's longer than max area
             len_sample = len(sample["input_ids"])
             if len_sample > self.max_area:
@@ -487,16 +511,27 @@ class StackDataset(StatefulIterableDataset):
 
 
 def stack_collate(samples: list[Sample]) -> Batch:
-    return {
+    batch: Batch = {
         "input_ids": torch.tensor(samples[0]["input_ids"], dtype=torch.long, device="cuda"),
         "position_ids": torch.tensor(samples[0]["position_ids"], dtype=torch.long, device="cuda"),
         "loss_mask": torch.tensor(samples[0]["loss_mask"], dtype=torch.bool, device="cuda"),
         "target_ids": torch.tensor(samples[0]["target_ids"], dtype=torch.long, device="cuda"),
     }
+    # Pass multimodal tensors through if present. ``mm_kwargs`` follows the RL
+    # convention: no batch dim, per-image concat along dim 0 (see
+    # ``trainer/rl/data.py::_micro_batch_to_tensor``). The model's HF forward
+    # is the schema.
+    mm_kwargs = samples[0].get("mm_kwargs")
+    if mm_kwargs is not None:
+        batch["mm_kwargs"] = {k: v.to("cuda") for k, v in mm_kwargs.items()}
+    mm_token_type_ids = samples[0].get("mm_token_type_ids")
+    if mm_token_type_ids is not None:
+        batch["mm_token_type_ids"] = torch.tensor(mm_token_type_ids, dtype=torch.long, device="cuda")
+    return batch
 
 
 def cat_collate(samples: list[Sample]) -> Batch:
-    return {
+    batch: Batch = {
         "input_ids": torch.stack([torch.tensor(sample["input_ids"]) for sample in samples], dim=0).long().to("cuda"),
         "position_ids": torch.stack([torch.tensor(sample["position_ids"]) for sample in samples], dim=0)
         .long()
@@ -504,6 +539,17 @@ def cat_collate(samples: list[Sample]) -> Batch:
         "loss_mask": torch.stack([torch.tensor(sample["loss_mask"]) for sample in samples], dim=0).bool().to("cuda"),
         "target_ids": torch.stack([torch.tensor(sample["target_ids"]) for sample in samples], dim=0).long().to("cuda"),
     }
+    # Defensive pass-through: CatDataset currently refuses to pack multimodal
+    # samples (NotImplementedError), so we only ever see one sample here when
+    # mm fields are set. Phase 1 will revisit this when document-aware VLM
+    # packing lands.
+    mm_kwargs = samples[0].get("mm_kwargs") if samples else None
+    if mm_kwargs is not None:
+        batch["mm_kwargs"] = {k: v.to("cuda") for k, v in mm_kwargs.items()}
+    mm_token_type_ids = samples[0].get("mm_token_type_ids") if samples else None
+    if mm_token_type_ids is not None:
+        batch["mm_token_type_ids"] = torch.tensor(mm_token_type_ids, dtype=torch.long, device="cuda").unsqueeze(0)
+    return batch
 
 
 def setup_and_interleave_datasets(
