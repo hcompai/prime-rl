@@ -262,12 +262,16 @@ def train(config: SFTConfig):
             micro_batch["mm_token_type_ids"].to("cuda") if micro_batch.get("mm_token_type_ids") is not None else None
         )
 
-        # Mirror the RL trainer's CP + VLM guard (see ``trainer/rl/train.py``):
-        # MRoPE in Qwen3-VL etc. requires global positions, and CP shards the
-        # sequence. Lifting this is Phase 2 (Ulysses-only first, then ring CP
-        # via pre-computed 3D positions).
+        # CP + VLM gating: Ulysses shards heads (not the sequence) so the
+        # global position semantics MRoPE / 1D RoPE rely on are preserved.
+        # Ring CP shards the sequence and would require either pre-computing
+        # 3D MRoPE positions before sharding (HF Qwen3-VL families) or a
+        # custom-VLM patch — both deferred to Phase 2b.
         if cp_enabled and mm_kwargs is not None:
-            raise NotImplementedError("Context parallelism is not supported with VLM/multimodal training")
+            assert config.model.cp_style == "ulysses", (
+                f"Context parallelism with VLM requires cp_style='ulysses' "
+                f"(got '{config.model.cp_style}'). Ring CP for VLMs is not yet supported."
+            )
 
         if cp_enabled:
             input_ids, position_ids = setup_cp_params(
@@ -292,6 +296,7 @@ def train(config: SFTConfig):
                     labels=masked_target_ids,
                     mm_kwargs=mm_kwargs,
                     mm_token_type_ids=mm_token_type_ids,
+                    cp_enabled=cp_enabled,
                 )
                 loss_sum = out["loss"] * token_count
             else:
@@ -301,6 +306,7 @@ def train(config: SFTConfig):
                     position_ids,
                     mm_kwargs=mm_kwargs,
                     mm_token_type_ids=mm_token_type_ids,
+                    cp_enabled=cp_enabled,
                 )
                 logits = out["logits"]
                 B, L, V = logits.shape

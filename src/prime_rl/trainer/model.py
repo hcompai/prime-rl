@@ -1114,6 +1114,7 @@ def forward(
     # not a renderer/processor output.
     mm_kwargs: dict[str, Tensor] | None = None,
     mm_token_type_ids: Int[Tensor, "batch seq"] | None = None,
+    cp_enabled: bool = False,
 ) -> PrimeLmOutput:
     # Build kwargs for model forward
     kwargs = {
@@ -1133,7 +1134,15 @@ def forward(
         # recomputes 3D positions from ``image_grid_thw`` and breaks if
         # given the trainer's pre-computed 1D ``position_ids``. Detect
         # via the mm_kwargs shape so we don't enumerate model_types.
-        if "image_grid_thw" not in mm_kwargs:
+        #
+        # *Under CP* (currently Ulysses-only for VLM, gated upstream) we
+        # always pass position_ids: the trainer's sequence-sharded values
+        # are the model's only source of *global* position info — letting
+        # the model arange locally would desync 1D RoPE rotations across
+        # CP ranks. Custom Qwen3-family VLMs in this repo use 1D RoPE
+        # (no real MRoPE — ``image_grid_thw`` only feeds the vision
+        # encoder), so passing global-but-sharded positions is correct.
+        if cp_enabled or "image_grid_thw" not in mm_kwargs:
             kwargs["position_ids"] = position_ids
     else:
         kwargs["position_ids"] = position_ids

@@ -81,3 +81,27 @@ def test_forward_keeps_position_ids_for_non_mrope_vlm():
 
     assert model.kwargs is not None
     torch.testing.assert_close(model.kwargs["position_ids"], position_ids)
+
+
+def test_forward_keeps_position_ids_under_cp_even_for_mrope_vlm():
+    """Under CP the trainer's position_ids are *globally* numbered but
+    sequence-sharded — the model's only source of global position info.
+    Letting an MRoPE-family model arange locally (the default strip path)
+    would desync RoPE rotations across CP ranks, so cp_enabled=True forces
+    position_ids through even when ``image_grid_thw`` is present.
+    """
+    model = _CaptureModel(SimpleNamespace(model_type="qwen3_vl"))
+    # Simulating rank 1 of a 2-rank CP shard: positions start at 4.
+    input_ids = torch.tensor([[1, 10, 10, 2]])
+    position_ids = torch.arange(4, 8).unsqueeze(0)
+
+    forward(
+        model,
+        input_ids,
+        position_ids,
+        mm_kwargs={"pixel_values": torch.ones(2, 3), "image_grid_thw": torch.tensor([[1, 1, 2]])},
+        cp_enabled=True,
+    )
+
+    assert model.kwargs is not None
+    torch.testing.assert_close(model.kwargs["position_ids"], position_ids)

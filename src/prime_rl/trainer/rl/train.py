@@ -394,9 +394,16 @@ def train(config: TrainerConfig):
 
             labels = shift_tensor_left(input_ids)
 
-            # VLM + CP is not supported: MRoPE requires global positions but CP shards the sequence
+            # CP + VLM gating: Ulysses shards heads (not the sequence) so the
+            # global position semantics MRoPE / 1D RoPE rely on are preserved.
+            # Ring CP shards the sequence and would require either pre-computing
+            # 3D MRoPE positions before sharding (HF Qwen3-VL families) or a
+            # custom-VLM patch — both deferred to Phase 2b.
             if cp_enabled and mm_kwargs is not None:
-                raise NotImplementedError("Context parallelism is not supported with VLM/multimodal training")
+                assert config.model.cp_style == "ulysses", (
+                    f"Context parallelism with VLM requires cp_style='ulysses' "
+                    f"(got '{config.model.cp_style}'). Ring CP for VLMs is not yet supported."
+                )
 
             if cp_enabled:
                 input_ids, forward_position_ids = setup_cp_params(
@@ -437,6 +444,7 @@ def train(config: TrainerConfig):
                     mm_kwargs=mm_kwargs,
                     mm_token_type_ids=mm_token_type_ids,
                     routed_experts=routed_experts,
+                    cp_enabled=cp_enabled,
                 )
 
             if out.get("logprobs") is None:
