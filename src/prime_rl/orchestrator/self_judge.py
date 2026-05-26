@@ -81,10 +81,10 @@ class SelfJudgeSpec:
     succ rollout, with the signs flipped for fail rollouts.
 
     ``label_prefix_token_ids`` maps each canonical label to the token ids
-    that prefix the assistant turn (``PROGRESS_LAST_TURN=<label>\\n``).
-    Used to detect and mask those tokens from the loss; the leading run
-    of newlines/whitespace tokens the model often emits before the label
-    is handled by tolerating a small ``mask_search_offset`` window.
+    of ``PROGRESS_LAST_TURN=<label>``. Used to detect and mask those tokens
+    from the loss. The label sits between ``</think>`` and ``<tool_call>``
+    in the new turn format, so we scan the entire turn span (not just a
+    short prefix window).
 
     ``mask_label_tokens`` toggles masking; off is fine because mass
     preservation already neutralises uniform-label hacking.
@@ -93,18 +93,17 @@ class SelfJudgeSpec:
     alpha: float
     label_prefix_token_ids: dict[str, list[int]]
     mask_label_tokens: bool = True
-    mask_search_offset: int = 12
 
 
 def _encode_label_prefix(tokenizer: "PreTrainedTokenizerBase", label: str) -> list[int]:
-    """Tokenise the literal ``PROGRESS_LAST_TURN=<label>\\n`` prefix.
+    """Tokenise the literal ``PROGRESS_LAST_TURN=<label>`` string.
 
     Special tokens are disabled so we get the same token sequence the model
-    would emit mid-stream. Newlines at the start are stripped because the
-    Qwen3 chat template ends the ``<|im_start|>assistant\\n`` opener with a
-    newline, so the next token is the start of the user-content stream.
+    would emit mid-stream. We omit the trailing newline because the literal
+    may appear on its own line OR followed by other text (e.g. PLAN: ...);
+    encoding without the newline makes the prefix match in both positions.
     """
-    text = f"PROGRESS_LAST_TURN={label}\n"
+    text = f"PROGRESS_LAST_TURN={label}"
     return tokenizer.encode(text, add_special_tokens=False)
 
 
@@ -149,22 +148,24 @@ def _detect_label_prefix(
     span_start: int,
     span_end: int,
     spec: SelfJudgeSpec,
-) -> tuple[str, int] | None:
-    """Within a turn span, find the ``PROGRESS_LAST_TURN=<label>\\n`` prefix.
+) -> tuple[str, int, int] | None:
+    """Find the ``PROGRESS_LAST_TURN=<label>`` token sequence anywhere in span.
 
-    Returns ``(label, prefix_end_in_sample)`` or ``None`` if no prefix is
-    detected at the start of the turn. We tolerate up to
-    ``mask_search_offset`` leading tokens (e.g. ``<think>\\n`` openers,
-    leading newlines) before requiring the prefix to begin.
+    The label sits between ``</think>`` and the tool call in the new turn
+    format, so we scan the full span (typically a few hundred tokens; the
+    inner ``for pos`` loop is bounded by span length and a tiny set of
+    label prefixes — cheap in absolute terms).
+
+    Returns ``(label, prefix_start, prefix_end_exclusive)`` or ``None``.
     """
-    max_offset = min(spec.mask_search_offset, span_end - span_start)
-    for offset in range(max_offset):
-        pos = span_start + offset
+    # First label found wins (turns have one label by construction).
+    for pos in range(span_start, span_end):
         for label, prefix in spec.label_prefix_token_ids.items():
-            if pos + len(prefix) > span_end:
+            n = len(prefix)
+            if pos + n > span_end:
                 continue
-            if completion_ids[pos : pos + len(prefix)] == prefix:
-                return label, pos + len(prefix)
+            if completion_ids[pos : pos + n] == prefix:
+                return label, pos, pos + n
     return None
 
 
@@ -210,9 +211,15 @@ def attach_self_judge_advantages(
     labels = [(progress_labels[i] if i < len(progress_labels) else DEFAULT_LABEL) for i in range(len(turn_spans))]
     labels = [lbl if lbl in LABEL_VALUE else DEFAULT_LABEL for lbl in labels]
 
-    # Mask the label-prefix tokens (so no gradient flows through the literal
-    # `PROGRESS_LAST_TURN=PROGRESS` characters) and refresh the turn spans
-    # to exclude those masked tokens from the weight-rescaling denominator.
+    # Mask only the literal ``PROGRESS_LAST_TURN=<label>`` token span so no
+    # gradient flows through the label characters (anti-hacking belt to
+    # mass-preservation's suspenders). The label sits mid-turn (between
+    # </think> and the tool call) so we mask just the prefix tokens — not
+    # the whole span up to it. Turn spans are intentionally NOT recomputed
+    # here: the masking creates tiny mask=False holes inside each turn but
+    # we still want to count those positions toward the turn's length so
+    # the surrounding reasoning + tool-call tokens carry the per-turn
+    # multiplier consistently.
     n_masked = 0
     if spec.mask_label_tokens:
         new_mask = list(completion_mask)
@@ -220,17 +227,13 @@ def attach_self_judge_advantages(
             hit = _detect_label_prefix(completion_ids, span_start, span_end, spec)
             if hit is None:
                 continue
-            _, prefix_end = hit
-            for pos in range(span_start, prefix_end):
+            _, prefix_start, prefix_end = hit
+            for pos in range(prefix_start, prefix_end):
                 if new_mask[pos]:
                     new_mask[pos] = False
                     n_masked += 1
         sample.completion_mask = new_mask
         completion_mask = new_mask
-        turn_spans = _find_turn_token_spans(completion_mask)
-        # Realign labels with the (possibly shorter) span list.
-        labels = [(progress_labels[i] if i < len(progress_labels) else DEFAULT_LABEL) for i in range(len(turn_spans))]
-        labels = [lbl if lbl in LABEL_VALUE else DEFAULT_LABEL for lbl in labels]
 
     if not turn_spans:
         return {"n_turns": 0, "n_masked_tokens": n_masked}
@@ -239,7 +242,11 @@ def attach_self_judge_advantages(
     # treat as +1 to avoid wiping the per-turn signal entirely; tied groups
     # are rare and the gradient magnitude is zero anyway.
     adv_sign = 1.0 if scalar_advantage >= 0 else -1.0
-    span_lens = [end - start for start, end in turn_spans]
+    # Use the trainable-token count per turn for the mass-preservation
+    # denominator. After label masking some token positions in each turn are
+    # mask=False; they shouldn't count toward the turn's "weight" because
+    # the loss ignores them anyway.
+    span_lens = [sum(1 for p in range(s, e) if completion_mask[p]) for s, e in turn_spans]
     total_len = sum(span_lens)
     if total_len == 0:
         return {"n_turns": 0, "n_masked_tokens": n_masked}
