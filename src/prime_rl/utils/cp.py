@@ -218,3 +218,60 @@ def setup_cp_params(
     input_ids = shard_for_cp(input_ids, cp_rank=cp_rank, cp_world_size=cp_world_size)
     position_ids = shard_for_cp(position_ids, cp_rank=cp_rank, cp_world_size=cp_world_size)
     return input_ids, position_ids
+
+
+# Module-level VLM-CP context. Mirrors the ULYSSES_PARAMS pattern: the trainer
+# publishes per-step state here before forward, and the VLM model's forward
+# reads it to slice ``image_embeds`` correctly per CP rank. Cleared at the
+# top of every compute_loss so non-CP / non-VLM runs see ``None``.
+_VLM_CP_PARAMS: dict = {}
+
+
+def set_vlm_cp_image_slice(start: int, count: int) -> None:
+    _VLM_CP_PARAMS["image_embed_slice"] = (int(start), int(count))
+
+
+def get_vlm_cp_image_slice() -> tuple[int, int] | None:
+    return _VLM_CP_PARAMS.get("image_embed_slice")
+
+
+def clear_vlm_cp_image_slice() -> None:
+    _VLM_CP_PARAMS.pop("image_embed_slice", None)
+
+
+def setup_vlm_cp_params(
+    mm_token_type_ids: torch.Tensor,
+    cp_rank: int,
+    cp_world_size: int,
+) -> torch.Tensor:
+    """Publish the per-rank ``image_embeds`` slice and shard ``mm_token_type_ids``.
+
+    Under CP each rank's local input_ids is a contiguous slice of the full
+    sequence. The vision encoder runs on the *full* pixel_values (identical
+    across CP ranks because mm_kwargs is not sharded), so the resulting
+    ``image_embeds`` has shape ``[total_image_tokens, hidden]`` — indexed by
+    image-placeholder position in the *global* sequence. The model's
+    ``masked_scatter(image_mask, image_embeds)`` runs on local input_ids, so
+    only the subset of ``image_embeds`` whose global positions land in *this*
+    rank's slice should be used.
+
+    We identify image positions via ``mm_token_type_ids == 1`` (renderer-supplied
+    modality marker, 0=text/1=image/2=video — see ``orchestrator/trajectories.py``).
+    ``start`` is the count of image positions in earlier CP ranks, ``count``
+    the count in this rank. The custom Qwen3-family VLM forward consumes this
+    via ``get_vlm_cp_image_slice``.
+
+    Returns the sharded ``mm_token_type_ids`` so the model's view stays
+    consistent with the sharded input_ids.
+    """
+    assert mm_token_type_ids.shape[0] == 1, "VLM CP setup assumes batch dimension == 1 (one pack per micro-batch)."
+    full_seq_len = mm_token_type_ids.shape[1]
+    assert full_seq_len % cp_world_size == 0, (
+        f"Sequence length {full_seq_len} must be divisible by cp_world_size {cp_world_size}."
+    )
+    shard_size = full_seq_len // cp_world_size
+    is_image = mm_token_type_ids == 1
+    start = int(is_image[:, : cp_rank * shard_size].sum().item())
+    count = int(is_image[:, cp_rank * shard_size : (cp_rank + 1) * shard_size].sum().item())
+    set_vlm_cp_image_slice(start, count)
+    return shard_for_cp(mm_token_type_ids, cp_rank=cp_rank, cp_world_size=cp_world_size)

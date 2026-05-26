@@ -20,9 +20,11 @@ from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
 from prime_rl.utils.cp import (
+    clear_vlm_cp_image_slice,
     gather_for_cp,
     gather_for_cp_wo_grad,
     setup_cp_params,
+    setup_vlm_cp_params,
     shard_for_cp,
 )
 from prime_rl.utils.logger import setup_logger
@@ -394,16 +396,14 @@ def train(config: TrainerConfig):
 
             labels = shift_tensor_left(input_ids)
 
-            # CP + VLM gating: Ulysses shards heads (not the sequence) so the
-            # global position semantics MRoPE / 1D RoPE rely on are preserved.
-            # Ring CP shards the sequence and would require either pre-computing
-            # 3D MRoPE positions before sharding (HF Qwen3-VL families) or a
-            # custom-VLM patch — both deferred to Phase 2b.
-            if cp_enabled and mm_kwargs is not None:
-                assert config.model.cp_style == "ulysses", (
-                    f"Context parallelism with VLM requires cp_style='ulysses' "
-                    f"(got '{config.model.cp_style}'). Ring CP for VLMs is not yet supported."
-                )
+            # CP + VLM: both ring and ulysses are supported. The vision encoder
+            # runs on the un-sharded ``pixel_values`` (same on every rank), so
+            # ``image_embeds`` is full while each rank's ``input_ids`` is
+            # sharded. ``setup_vlm_cp_params`` publishes the per-rank
+            # (start, count) slice into ``image_embeds`` that the VLM model
+            # reads in its image-scatter path. Clear the module-global slice
+            # for non-CP / non-VLM steps so global state stays honest.
+            clear_vlm_cp_image_slice()
 
             if cp_enabled:
                 input_ids, forward_position_ids = setup_cp_params(
@@ -412,6 +412,8 @@ def train(config: TrainerConfig):
                 labels = shard_for_cp(labels, cp_rank=cp_rank, cp_world_size=cp_size)
                 if routed_experts is not None:
                     routed_experts = shard_for_cp(routed_experts, cp_rank=cp_rank, cp_world_size=cp_size)
+                if mm_token_type_ids is not None:
+                    mm_token_type_ids = setup_vlm_cp_params(mm_token_type_ids, cp_rank=cp_rank, cp_world_size=cp_size)
             else:
                 forward_position_ids = position_ids
 

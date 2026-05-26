@@ -840,6 +840,22 @@ class Qwen3_5MoeVLMModel(nn.Module):
             vision_output = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True)
             image_embeds = vision_output.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
 
+            # CP slice: under context parallelism, ``input_ids`` is a sequence
+            # shard of the global pack but ``image_embeds`` is full (vision
+            # runs on the un-sharded ``pixel_values``, identical across CP
+            # ranks). Slice to the subset of image embeddings whose global
+            # positions land in *this* CP rank's sequence slice — without
+            # this, ranks would scatter the wrong (always-leading) rows
+            # whenever images span a CP boundary. The trainer publishes
+            # (start, count) via ``setup_vlm_cp_params``; ``None`` when CP
+            # is disabled, so the full tensor passes through unchanged.
+            from prime_rl.utils.cp import get_vlm_cp_image_slice
+
+            cp_slice = get_vlm_cp_image_slice()
+            if cp_slice is not None:
+                start, count = cp_slice
+                image_embeds = image_embeds[start : start + count]
+
             image_mask = input_ids == self.config.image_token_id
             image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)

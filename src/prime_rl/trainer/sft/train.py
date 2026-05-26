@@ -19,7 +19,7 @@ from torch.profiler import profile, ProfilerActivity, record_function
 from prime_rl.trainer.ckpt import setup_ckpt_managers
 from prime_rl.utils.pathing import resolve_latest_ckpt_step
 from prime_rl.configs.sft import SFTConfig
-from prime_rl.utils.cp import setup_cp_params, shard_for_cp
+from prime_rl.utils.cp import clear_vlm_cp_image_slice, setup_cp_params, setup_vlm_cp_params, shard_for_cp
 from prime_rl.trainer.runs import Progress, get_multi_run_manager, setup_multi_run_manager
 from prime_rl.trainer.models.layers.lora import set_lora_num_tokens
 from prime_rl.utils.logger import setup_logger
@@ -262,16 +262,14 @@ def train(config: SFTConfig):
             micro_batch["mm_token_type_ids"].to("cuda") if micro_batch.get("mm_token_type_ids") is not None else None
         )
 
-        # CP + VLM gating: Ulysses shards heads (not the sequence) so the
-        # global position semantics MRoPE / 1D RoPE rely on are preserved.
-        # Ring CP shards the sequence and would require either pre-computing
-        # 3D MRoPE positions before sharding (HF Qwen3-VL families) or a
-        # custom-VLM patch — both deferred to Phase 2b.
-        if cp_enabled and mm_kwargs is not None:
-            assert config.model.cp_style == "ulysses", (
-                f"Context parallelism with VLM requires cp_style='ulysses' "
-                f"(got '{config.model.cp_style}'). Ring CP for VLMs is not yet supported."
-            )
+        # CP + VLM: both ring and ulysses are supported. The bug to watch is
+        # that the vision encoder runs on the un-sharded ``pixel_values`` (same
+        # on every rank), so ``image_embeds`` is full while each rank's
+        # ``input_ids`` is sharded. ``setup_vlm_cp_params`` publishes the
+        # per-rank (start, count) slice into ``image_embeds`` that the VLM
+        # model reads in its image-scatter path. Clearing the module-global
+        # slice for non-CP / non-VLM steps keeps the global state honest.
+        clear_vlm_cp_image_slice()
 
         if cp_enabled:
             input_ids, position_ids = setup_cp_params(
@@ -279,6 +277,8 @@ def train(config: SFTConfig):
             )
             target_ids = shard_for_cp(target_ids, cp_rank=cp_rank, cp_world_size=cp_size)
             loss_mask = shard_for_cp(loss_mask, cp_rank=cp_rank, cp_world_size=cp_size)
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = setup_vlm_cp_params(mm_token_type_ids, cp_rank=cp_rank, cp_world_size=cp_size)
 
         if config.model.lora is not None:
             set_lora_num_tokens(torch.full((1,), input_ids.numel(), dtype=torch.int32, device="cuda"))
