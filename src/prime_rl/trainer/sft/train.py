@@ -198,7 +198,10 @@ def train(config: SFTConfig):
     # Set up the dataset and dataloader
     logger.info(f"Initializing data ({config.data})")
     dataset = setup_dataset(tokenizer, config.data, config.model.cp, renderer=renderer)
-    dataloader = setup_dataloader(dataset, config.data)
+    # ``pad_token_id`` is only used by the VLM packing path; text-only packs
+    # are exact-length and never pad. Fall back to 0 if the tokenizer has none.
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    dataloader = setup_dataloader(dataset, config.data, pad_token_id=pad_token_id)
     dataiter = iter(dataloader)
 
     val_raw_dataset = None
@@ -341,7 +344,7 @@ def train(config: SFTConfig):
             raw_dataset=val_raw_dataset,
             renderer=renderer,
         )
-        val_dataloader = setup_dataloader(val_dataset, config.val.data)
+        val_dataloader = setup_dataloader(val_dataset, config.val.data, pad_token_id=pad_token_id)
 
         # No train/eval switch: no dropout in these models, and toggling would trigger torch.compile recompilation
         mean_loss, nan_count = run_eval_loop(val_dataloader)

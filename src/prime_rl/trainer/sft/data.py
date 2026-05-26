@@ -13,7 +13,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-from prime_rl.configs.sft import DataConfig, LossMaskConfig, SFTDataConfig
+from prime_rl.configs.sft import DataConfig, FakeMultimodalConfig, LossMaskConfig, SFTDataConfig
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.chat_template import (
     IncrementalTokenizationError,
@@ -92,12 +92,17 @@ class FakeDataset(StatefulIterableDataset):
         seq_len: int,
         length: Literal["fixed", "variable"] = "fixed",
         input_ids: Literal["increasing", "random"] = "random",
+        multimodal: FakeMultimodalConfig | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.length = length
         self.input_ids = input_ids
+        # ``multimodal`` is opt-in. When set, each yielded sample carries
+        # toy ``mm_kwargs`` / ``mm_token_type_ids`` so the document-aware
+        # VLM packer can be exercised without a real VLM dataset.
+        self.multimodal = multimodal
 
     def __iter__(self):
         while True:
@@ -121,9 +126,62 @@ class FakeDataset(StatefulIterableDataset):
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
             }
+            if self.multimodal is not None:
+                self._inject_multimodal(fake_sample, self.multimodal)
             self.num_samples["fake"] += 1
             self.num_tokens["fake"] += len(input_ids)
             yield fake_sample
+
+    @staticmethod
+    def _inject_multimodal(sample: dict, mm: FakeMultimodalConfig) -> None:
+        """Overlay fake image-placeholder tokens and attach toy mm tensors.
+
+        Mirrors the RL contract (``trainer/rl/data.py::TensorMicroBatch``):
+        ``mm_kwargs`` is a flat dict matching the model forward signature
+        (``pixel_values`` + ``image_grid_thw`` for Qwen3-VL families), with
+        no batch dim — per-image concat along dim 0. ``mm_token_type_ids``
+        is per-token (0=text, 1=image). Shapes here are toy and won't run
+        through a real vision encoder; the goal is to exercise the packer.
+        """
+        seq = len(sample["input_ids"])
+        n_imgs = mm.images_per_sample
+        tokens_per_img = mm.image_tokens_per_image
+        total_img_tokens = n_imgs * tokens_per_img
+        if total_img_tokens >= seq:
+            # Not enough room for placeholders + at least one text token —
+            # leave this sample text-only rather than overflowing.
+            return
+
+        # Place each image's run of placeholders at evenly-spaced offsets so
+        # multiple-image docs exercise interleaving. The exact offsets don't
+        # matter for packer correctness, only that mm_token_type_ids agrees
+        # with input_ids.
+        ids = list(sample["input_ids"])
+        type_ids = [0] * seq
+        stride = max(1, (seq - total_img_tokens) // n_imgs)
+        cursor = 0
+        for _ in range(n_imgs):
+            for k in range(tokens_per_img):
+                pos = cursor + k
+                ids[pos] = mm.image_token_id
+                type_ids[pos] = 1
+            cursor += tokens_per_img + stride
+
+        sample["input_ids"] = ids
+        # Re-derive target_ids so EOS/image-token placement stays consistent
+        # with input_ids (target = next-token shift, like SFTDataset).
+        sample["target_ids"] = ids[1:] + [ids[-1]]
+        sample["mm_token_type_ids"] = type_ids
+        # ``pixel_values``: per-image, leading dim = grid token count, second
+        # dim = a small fake feature dim. Concatenate per-image along dim 0
+        # so the packer's dim-0 concat across docs is exercised non-trivially.
+        sample["mm_kwargs"] = {
+            "pixel_values": torch.zeros(n_imgs * tokens_per_img, mm.fake_feature_dim, dtype=torch.float32),
+            # ``image_grid_thw``: one row per image, [T, H, W]. Toy 1×1×K so
+            # T*H*W == tokens_per_img — the convention every Qwen3-VL family
+            # tile uses.
+            "image_grid_thw": torch.tensor([[1, 1, tokens_per_img]] * n_imgs, dtype=torch.long),
+        }
 
 
 class SFTDataset(StatefulIterableDataset):
@@ -356,12 +414,31 @@ class SFTDataset(StatefulIterableDataset):
 
 
 class CatDataset(StatefulIterableDataset):
-    """A dataset that concatenates samples into a single sequence with a fixed length."""
+    """A dataset that concatenates samples into a single sequence with a fixed length.
 
-    def __init__(self, dataset: StatefulIterableDataset, seq_len: int):
+    Dispatches on the first sample: text-only samples use the original overrun
+    + truncate-to-``seq_len`` policy; multimodal samples (carrying ``mm_kwargs``
+    or ``mm_token_type_ids``) use a document-aware path that never splits a
+    document mid-stream — splitting would separate an image's placeholder
+    tokens from its ``pixel_values`` entry. The VLM path concatenates per-doc
+    ``mm_kwargs`` tensors along dim 0 (mirroring the RL orchestrator
+    convention; see ``orchestrator/trajectories.py::_pack_mm_kwargs_from_renderer``)
+    and pads each pack to ``seq_len`` so all packs have a consistent shape.
+
+    Document-aware attention masking falls out for free: the existing
+    ``cu_seqlens`` derivation in ``utils/sequence.py`` keys on
+    ``position_ids == 0`` markers, and the VLM path preserves each
+    document's per-doc 0-indexed position_ids unchanged.
+    """
+
+    def __init__(self, dataset: StatefulIterableDataset, seq_len: int, pad_token_id: int = 0):
         self.logger = get_logger()
         self.dataset = dataset
         self.seq_len = seq_len
+        # Used only when padding underfilled VLM packs. Defaults to 0 because
+        # not every tokenizer defines a pad token; loss_mask=False on pad
+        # positions so the choice never affects training.
+        self.pad_token_id = pad_token_id
 
     def state_dict(self) -> dict:
         return {"dataset": self.dataset.state_dict()}
@@ -370,14 +447,31 @@ class CatDataset(StatefulIterableDataset):
         self.dataset.load_state_dict(state_dict["dataset"])
 
     def __iter__(self):
+        iterator = iter(self.dataset)
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return
+
+        # Peek the first sample to choose the packing strategy. Mixed streams
+        # (text + mm samples interleaved) are not supported: the text path's
+        # ``extend(value)`` would fail on a dict ``mm_kwargs`` with a clear
+        # assertion, and the VLM path assumes every doc carries the same
+        # ``mm_kwargs`` schema.
+        is_multimodal = first.get("mm_kwargs") is not None or first.get("mm_token_type_ids") is not None
+
+        def chained():
+            yield first
+            yield from iterator
+
+        if is_multimodal:
+            yield from self._iter_vlm(chained())
+        else:
+            yield from self._iter_text(chained())
+
+    def _iter_text(self, samples):
         packed_samples, seq_len = defaultdict(list), 0
-        for sample in self.dataset:
-            if sample.get("mm_kwargs") is not None or sample.get("mm_token_type_ids") is not None:
-                raise NotImplementedError(
-                    "Multimodal samples are not yet supported by CatDataset packing. "
-                    "Document-aware VLM packing is Phase 1; use a non-packing dataloader "
-                    "(or a VLM-specific dataset class) for now."
-                )
+        for sample in samples:
             # Add sample to packed samples
             for key, value in sample.items():
                 assert isinstance(value, list), f"Value for key {key} must be a list"
@@ -393,6 +487,84 @@ class CatDataset(StatefulIterableDataset):
                     packed_samples[key] = value[: self.seq_len]
                 yield packed_samples
                 packed_samples, seq_len = defaultdict(list), 0
+
+    def _iter_vlm(self, samples):
+        packed_samples = defaultdict(list)
+        pending_mm_kwargs: list[dict[str, Tensor]] = []
+        seq_len_acc = 0
+
+        for sample in samples:
+            sample_len = len(sample["input_ids"])
+
+            # Truncating mid-doc is unsafe (could split an image from its
+            # placeholders). Drop oversize docs with a warning so the stream
+            # keeps flowing; the upstream filter should size samples to fit.
+            if sample_len > self.seq_len:
+                self.logger.warning(
+                    f"Dropping multimodal sample of length {sample_len} > seq_len ({self.seq_len}); "
+                    "truncation would risk splitting an image from its placeholders."
+                )
+                continue
+
+            # Flush before adding when this doc would overflow. Yields a
+            # (possibly underfilled) pack rather than splitting the new doc.
+            if seq_len_acc > 0 and seq_len_acc + sample_len > self.seq_len:
+                self._finalize_vlm_pack(packed_samples, pending_mm_kwargs, seq_len_acc)
+                yield packed_samples
+                packed_samples = defaultdict(list)
+                pending_mm_kwargs = []
+                seq_len_acc = 0
+
+            for key, value in sample.items():
+                if key == "mm_kwargs":
+                    if value is not None:
+                        pending_mm_kwargs.append(value)
+                elif isinstance(value, list):
+                    packed_samples[key].extend(value)
+
+            seq_len_acc += sample_len
+
+            # Exact fit — yield without pad to keep packs maximally dense.
+            if seq_len_acc == self.seq_len:
+                self._finalize_vlm_pack(packed_samples, pending_mm_kwargs, seq_len_acc)
+                yield packed_samples
+                packed_samples = defaultdict(list)
+                pending_mm_kwargs = []
+                seq_len_acc = 0
+
+    def _finalize_vlm_pack(
+        self,
+        packed_samples: dict,
+        pending_mm_kwargs: list[dict[str, Tensor]],
+        seq_len_acc: int,
+    ) -> None:
+        """In place: pad token-level lists to ``seq_len`` and attach concatenated ``mm_kwargs``."""
+        pad = self.seq_len - seq_len_acc
+        if pad > 0:
+            packed_samples["input_ids"].extend([self.pad_token_id] * pad)
+            packed_samples["target_ids"].extend([self.pad_token_id] * pad)
+            # Continue position_ids from the last value so pad tokens stay
+            # inside the trailing document's cu_seqlens window — opening a
+            # fresh window on pad-only tokens would waste attention compute
+            # on pad self-attention.
+            last_pos = packed_samples["position_ids"][-1] if packed_samples["position_ids"] else -1
+            packed_samples["position_ids"].extend(range(last_pos + 1, last_pos + 1 + pad))
+            packed_samples["loss_mask"].extend([False] * pad)
+            packed_samples["mm_token_type_ids"].extend([0] * pad)
+
+        mm_kwargs: dict[str, Tensor] = {}
+        if pending_mm_kwargs:
+            keys = set(pending_mm_kwargs[0].keys())
+            for doc in pending_mm_kwargs[1:]:
+                if set(doc.keys()) != keys:
+                    raise ValueError(
+                        "Inconsistent mm_kwargs keys across packed docs "
+                        f"({sorted(keys)} vs {sorted(doc.keys())}). Every doc in a "
+                        "multimodal stream must share the same model's forward signature."
+                    )
+            for k in pending_mm_kwargs[0]:
+                mm_kwargs[k] = torch.cat([doc[k] for doc in pending_mm_kwargs], dim=0)
+        packed_samples["mm_kwargs"] = mm_kwargs
 
 
 class StackDataset(StatefulIterableDataset):
@@ -431,9 +603,9 @@ class StackDataset(StatefulIterableDataset):
         for sample in self.dataset:
             if sample.get("mm_kwargs") is not None or sample.get("mm_token_type_ids") is not None:
                 raise NotImplementedError(
-                    "Multimodal samples are not yet supported by StackDataset bucketing. "
-                    "Padding pixel_values / mm_token_type_ids across bucket samples is "
-                    "Phase 1 work; use a non-packing dataloader for VLM samples."
+                    "Multimodal samples are not supported by StackDataset bucketing. "
+                    "Use pack_function='cat' for VLM: CatDataset has a document-aware "
+                    "path that concatenates per-doc mm_kwargs and never splits an image."
                 )
             # Truncate sample if it's longer than max area
             len_sample = len(sample["input_ids"])
@@ -631,7 +803,11 @@ def setup_dataset(
 ) -> StatefulIterableDataset:
     if config.type == "fake":
         return FakeDataset(
-            vocab_size=tokenizer.vocab_size, seq_len=config.seq_len, length=config.length, input_ids=config.input_ids
+            vocab_size=tokenizer.vocab_size,
+            seq_len=config.seq_len,
+            length=config.length,
+            input_ids=config.input_ids,
+            multimodal=config.multimodal,
         )
     elif config.type == "sft":
         if raw_dataset is None:
@@ -651,12 +827,18 @@ def setup_dataset(
         raise ValueError(f"Invalid dataset type: {config.type}")
 
 
-def setup_dataloader(dataset: StatefulIterableDataset, config: DataConfig) -> StatefulDataLoader:
+def setup_dataloader(
+    dataset: StatefulIterableDataset,
+    config: DataConfig,
+    pad_token_id: int = 0,
+) -> StatefulDataLoader:
     if config.pack_function == "stack":
         stacking_dataset = StackDataset(dataset, config.seq_len * config.micro_batch_size)
         return StatefulDataLoader(stacking_dataset, batch_size=1, collate_fn=stack_collate)
     elif config.pack_function == "cat":
-        packing_dataset = CatDataset(dataset, config.seq_len * config.micro_batch_size)
+        # ``pad_token_id`` is only consumed by the VLM packing path (used to
+        # pad underfilled doc-aware packs); text-only packs never pad.
+        packing_dataset = CatDataset(dataset, config.seq_len * config.micro_batch_size, pad_token_id=pad_token_id)
         return StatefulDataLoader(packing_dataset, batch_size=1, collate_fn=cat_collate)
     else:
         raise ValueError(f"Invalid pack function: {config.pack_function}")

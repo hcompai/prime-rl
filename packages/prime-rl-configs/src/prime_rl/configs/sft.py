@@ -47,6 +47,29 @@ class BaseDataConfig(BaseConfig):
         return self
 
 
+class FakeMultimodalConfig(BaseConfig):
+    """Shape knobs for fake VLM samples emitted by ``FakeDataset``.
+
+    Exists to exercise the document-aware VLM packer end-to-end without
+    needing real images or a vision encoder. Shapes are intentionally
+    tiny and *not* compatible with any real VLM's vision encoder — these
+    samples are for data-pipeline testing, not for actually running a
+    forward through a vision model.
+    """
+
+    image_token_id: int = Field(1, ge=0)
+    """Sentinel token id used as the image placeholder in input_ids."""
+
+    images_per_sample: int = Field(1, ge=1)
+    """Number of fake images attached to each sample."""
+
+    image_tokens_per_image: int = Field(4, ge=1)
+    """Placeholder tokens emitted in input_ids per image."""
+
+    fake_feature_dim: int = Field(4, ge=1)
+    """Per-patch feature dim of fake ``pixel_values`` (toy shape for the packer)."""
+
+
 class FakeDataConfig(BaseDataConfig):
     type: Literal["fake"] = "fake"
 
@@ -55,6 +78,9 @@ class FakeDataConfig(BaseDataConfig):
 
     input_ids: Literal["increasing", "random"] = "increasing"
     """Token id generator: ``increasing`` for deterministic sequences, ``random`` for random ids."""
+
+    multimodal: FakeMultimodalConfig | None = None
+    """When set, emit fake multimodal samples (``mm_kwargs`` + ``mm_token_type_ids``) to exercise the VLM packer."""
 
 
 class LossMaskConfig(BaseConfig):
