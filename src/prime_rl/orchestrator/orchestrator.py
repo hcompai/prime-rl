@@ -43,7 +43,7 @@ from prime_rl.orchestrator.filters import apply_filters, setup_filters
 from prime_rl.orchestrator.scheduler import Scheduler
 from prime_rl.orchestrator.self_judge import (
     SelfJudgeSpec,
-    attach_self_judge_advantages,
+    attach_self_judge_advantages_to_rollout,
     resolve_self_judge_spec,
 )
 from prime_rl.orchestrator.utils import (
@@ -577,20 +577,23 @@ async def orchestrate(config: OrchestratorConfig):
                 sample.reward = rollout["reward"]
                 if config.use_sft_loss:
                     sample.sft_loss = True
-                # Per-turn self-judged credit assignment. Mutates sample in place
-                # (sets completion_advantages and, when enabled, prunes label-prefix
-                # tokens from completion_mask). Runs AFTER advantage is set because
-                # the multiplier sign depends on it.
-                if self_judge_spec is not None and progress_labels:
-                    stats = attach_self_judge_advantages(
-                        sample,
-                        progress_labels,
-                        sample.advantage,
-                        self_judge_spec,
-                    )
-                    if stats is not None:
-                        for k, v in stats.items():
-                            self_judge_stats.setdefault(k, []).append(float(v))
+            # Per-turn self-judged credit assignment. Operates on ALL samples
+            # of the rollout together so mass preservation pools spans across
+            # samples (extension breaks → multi-sample rollouts otherwise
+            # get a no-op single-span renorm per sample). Mutates samples in
+            # place (sets completion_advantages and, when enabled, prunes
+            # label-prefix tokens from completion_mask).
+            if self_judge_spec is not None and samples:
+                stats = attach_self_judge_advantages_to_rollout(
+                    samples,
+                    progress_labels or [],
+                    rollout["advantage"],
+                    self_judge_spec,
+                )
+                if stats is not None:
+                    for k, v in stats.items():
+                        self_judge_stats.setdefault(k, []).append(float(v))
+            for sample in samples:
                 sample_decode_tokens = sum(sample.completion_mask)
                 sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens
                 rollout_decode_tokens += sample_decode_tokens

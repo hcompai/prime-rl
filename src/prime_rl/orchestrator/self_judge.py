@@ -91,20 +91,44 @@ class SelfJudgeSpec:
     """
 
     alpha: float
-    label_prefix_token_ids: dict[str, list[int]]
+    # Each label maps to a list of *equivalent* token-id sequences that
+    # match the literal ``PROGRESS_LAST_TURN=<label>`` in different
+    # preceding-context tokenisations (BPE merges depend on the boundary).
+    label_prefix_token_ids: dict[str, list[list[int]]]
     mask_label_tokens: bool = True
 
 
-def _encode_label_prefix(tokenizer: "PreTrainedTokenizerBase", label: str) -> list[int]:
-    """Tokenise the literal ``PROGRESS_LAST_TURN=<label>`` string.
+def _encode_label_prefix_variants(tokenizer: "PreTrainedTokenizerBase", label: str) -> list[list[int]]:
+    """Tokenise ``PROGRESS_LAST_TURN=<label>`` in a few preceding-context
+    variants and return only the suffix that corresponds to the literal
+    itself.
 
-    Special tokens are disabled so we get the same token sequence the model
-    would emit mid-stream. We omit the trailing newline because the literal
-    may appear on its own line OR followed by other text (e.g. PLAN: ...);
-    encoding without the newline makes the prefix match in both positions.
+    BPE tokenisation is context-dependent: the tokens for
+    ``PROGRESS_LAST_TURN=ACHIEVED`` differ depending on whether the
+    preceding character is ``>`` (from ``</think>``), ``\n``, or a space.
+    We pre-compute all plausible variants once and try each at detection
+    time. Empirically with Qwen3-VL there are usually 1–2 distinct
+    encodings; we deduplicate.
     """
     text = f"PROGRESS_LAST_TURN={label}"
-    return tokenizer.encode(text, add_special_tokens=False)
+    base_ids = tokenizer.encode(text, add_special_tokens=False)
+    variants: list[list[int]] = [base_ids]
+    # Encode in context with various leading characters; strip the leading
+    # tokens to get just the literal's suffix tokens. We diff against a
+    # baseline encoding of just the lead string to isolate the suffix.
+    for lead in ("\n", " ", "\n\n", ">\n", "</think>\n"):
+        lead_ids = tokenizer.encode(lead, add_special_tokens=False)
+        full_ids = tokenizer.encode(lead + text, add_special_tokens=False)
+        if len(full_ids) >= len(lead_ids) and full_ids[: len(lead_ids)] == lead_ids:
+            suffix = full_ids[len(lead_ids):]
+        else:
+            # BPE merged across the boundary; keep the tail that ends with
+            # the same final token as base_ids (heuristic, length-bounded).
+            cut = max(0, len(full_ids) - len(base_ids) - 2)
+            suffix = full_ids[cut:]
+        if suffix and suffix not in variants:
+            variants.append(suffix)
+    return variants
 
 
 def resolve_self_judge_spec(
@@ -113,7 +137,7 @@ def resolve_self_judge_spec(
     mask_label_tokens: bool = True,
 ) -> SelfJudgeSpec:
     """Pre-compute label-prefix token sequences once at orchestrator start."""
-    prefix_ids = {label: _encode_label_prefix(tokenizer, label) for label in LABEL_VALUE}
+    prefix_ids = {label: _encode_label_prefix_variants(tokenizer, label) for label in LABEL_VALUE}
     return SelfJudgeSpec(
         alpha=alpha,
         label_prefix_token_ids=prefix_ids,
@@ -158,15 +182,167 @@ def _detect_label_prefix(
 
     Returns ``(label, prefix_start, prefix_end_exclusive)`` or ``None``.
     """
-    # First label found wins (turns have one label by construction).
+    # First label-variant found wins (turns have one label by construction).
     for pos in range(span_start, span_end):
-        for label, prefix in spec.label_prefix_token_ids.items():
-            n = len(prefix)
-            if pos + n > span_end:
-                continue
-            if completion_ids[pos : pos + n] == prefix:
-                return label, pos, pos + n
+        for label, variants in spec.label_prefix_token_ids.items():
+            for prefix in variants:
+                n = len(prefix)
+                if pos + n > span_end:
+                    continue
+                if completion_ids[pos : pos + n] == prefix:
+                    return label, pos, pos + n
     return None
+
+
+def attach_self_judge_advantages_to_rollout(
+    samples: list["TrainingSample"],
+    progress_labels: list[str],
+    scalar_advantage: float,
+    spec: SelfJudgeSpec,
+) -> dict[str, int | float] | None:
+    """Apply per-turn credit assignment across *all* samples of a rollout.
+
+    When ``interleave_rollout`` splits a rollout into multiple TrainingSamples
+    (extension property breaking, e.g. due to context compaction), naive
+    per-sample mass preservation degenerates: a single-turn sample has only
+    one span, so its multiplier is trivially 1.0 and no per-turn signal is
+    delivered. This function instead pools spans across all samples of the
+    rollout so the linear weights compete globally, and only renormalises
+    once on the union — preserving the invariant ``Σ_s m[s] · len[s] = Σ
+    len[s]`` over the full rollout.
+
+    Mutates each sample's ``completion_advantages`` and (when enabled)
+    ``completion_mask`` in place. Returns aggregated stats for wandb.
+    """
+    if not samples or scalar_advantage is None:
+        return None
+
+    # Per-sample turn spans + detected labels + prefix spans.
+    sample_spans: list[list[tuple[int, int]]] = []
+    sample_labels: list[list[str]] = []
+    sample_prefixes: list[list[tuple[int, int] | None]] = []
+    for sample in samples:
+        cm = sample.completion_mask
+        cids = sample.completion_ids
+        if not cids:
+            sample_spans.append([])
+            sample_labels.append([])
+            sample_prefixes.append([])
+            continue
+        spans = _find_turn_token_spans(cm)
+        labels: list[str] = []
+        prefixes: list[tuple[int, int] | None] = []
+        for s, e in spans:
+            hit = _detect_label_prefix(cids, s, e, spec)
+            if hit is None:
+                labels.append(DEFAULT_LABEL)
+                prefixes.append(None)
+            else:
+                lbl, ps, pe = hit
+                labels.append(lbl if lbl in LABEL_VALUE else DEFAULT_LABEL)
+                prefixes.append((ps, pe))
+        sample_spans.append(spans)
+        sample_labels.append(labels)
+        sample_prefixes.append(prefixes)
+
+    # Flatten into a global turn list. Track which sample / span index each
+    # global turn belongs to so we can map multipliers back.
+    flat: list[tuple[int, int, str, tuple[int, int] | None]] = []  # (sample_idx, span_idx, label, prefix)
+    for si, (spans, labels, prefixes) in enumerate(zip(sample_spans, sample_labels, sample_prefixes)):
+        for span_idx, (lbl, pref) in enumerate(zip(labels, prefixes)):
+            flat.append((si, span_idx, lbl, pref))
+
+    if not flat:
+        return None
+
+    # Best-effort positional fallback: if detection failed for some turns
+    # but the env-side parser caught labels in order, fill in the gaps
+    # using positional indexing into the rollout-wide labels list. This is
+    # naive (sample turn-order vs trajectory turn-order can disagree when
+    # extension breaks then resumes) and only helps when the rollout is
+    # mostly linear; on disagreement the rare token-level detection
+    # already produced the correct label per span.
+    if progress_labels:
+        # Number turns in flat order across all samples.
+        for i, (si, span_idx, lbl, pref) in enumerate(flat):
+            if pref is None and lbl == DEFAULT_LABEL and i < len(progress_labels):
+                cand = progress_labels[i]
+                if cand in LABEL_VALUE:
+                    flat[i] = (si, span_idx, cand, pref)
+
+    # Apply label masking before computing span_lens.
+    n_masked = 0
+    if spec.mask_label_tokens:
+        for sample, prefixes in zip(samples, sample_prefixes):
+            if not prefixes:
+                continue
+            new_mask = list(sample.completion_mask)
+            for pref in prefixes:
+                if pref is None:
+                    continue
+                ps, pe = pref
+                for pos in range(ps, pe):
+                    if new_mask[pos]:
+                        new_mask[pos] = False
+                        n_masked += 1
+            sample.completion_mask = new_mask
+
+    # Trainable-token length per global turn (after masking).
+    span_lens: list[int] = []
+    for si, span_idx, _lbl, _pref in flat:
+        s, e = sample_spans[si][span_idx]
+        cm = samples[si].completion_mask
+        span_lens.append(sum(1 for p in range(s, e) if cm[p]))
+    total_len = sum(span_lens)
+    if total_len == 0:
+        return {
+            "n_turns": len(flat),
+            "n_samples": len(samples),
+            "n_masked_tokens": n_masked,
+        }
+
+    adv_sign = 1.0 if scalar_advantage >= 0 else -1.0
+    raw_weights = [1.0 + spec.alpha * LABEL_VALUE[lbl] * adv_sign for _si, _idx, lbl, _pref in flat]
+    raw_weights = [max(0.05, w) for w in raw_weights]
+
+    weighted_sum = sum(w * L for w, L in zip(raw_weights, span_lens))
+    if weighted_sum <= 0:
+        return {
+            "n_turns": len(flat),
+            "n_samples": len(samples),
+            "n_masked_tokens": n_masked,
+        }
+    scale = total_len / weighted_sum
+    multipliers = [w * scale for w in raw_weights]
+
+    # Initialise per_token_advantages on every sample, then overlay the
+    # per-turn multipliers.
+    for sample in samples:
+        sample.completion_advantages = [scalar_advantage] * len(sample.completion_ids)
+    for (si, span_idx, _lbl, _pref), m in zip(flat, multipliers):
+        s, e = sample_spans[si][span_idx]
+        adv_t = scalar_advantage * m
+        per_tok = samples[si].completion_advantages
+        for pos in range(s, e):
+            per_tok[pos] = adv_t
+
+    label_counts = {lbl: 0 for lbl in LABEL_VALUE}
+    for _si, _idx, lbl, _pref in flat:
+        label_counts[lbl] = label_counts.get(lbl, 0) + 1
+    n_detected = sum(1 for _si, _idx, _lbl, pref in flat if pref is not None)
+    return {
+        "n_turns": len(flat),
+        "n_samples": len(samples),
+        "n_masked_tokens": n_masked,
+        "n_token_detected_labels": n_detected,
+        "label_count_REGRESS": label_counts["REGRESS"],
+        "label_count_NEUTRAL": label_counts["NEUTRAL"],
+        "label_count_PROGRESS": label_counts["PROGRESS"],
+        "label_count_ACHIEVED": label_counts["ACHIEVED"],
+        "mean_multiplier": sum(multipliers) / len(multipliers),
+        "max_multiplier": max(multipliers),
+        "min_multiplier": min(multipliers),
+    }
 
 
 def attach_self_judge_advantages(
@@ -205,29 +381,57 @@ def attach_self_judge_advantages(
     if not turn_spans:
         return None
 
-    # Align labels with turn spans. Some rollouts have more trajectory steps
-    # than this sample contains (extension property broke mid-rollout); only
-    # use the labels covering this sample's spans.
-    labels = [(progress_labels[i] if i < len(progress_labels) else DEFAULT_LABEL) for i in range(len(turn_spans))]
-    labels = [lbl if lbl in LABEL_VALUE else DEFAULT_LABEL for lbl in labels]
+    # Per-turn label extracted DIRECTLY from completion_ids. This is the
+    # ground-truth label the model emitted at that exact token position, so
+    # it correctly aligns with the turn even when ``interleave_rollout``
+    # splits a long rollout into multiple TrainingSamples (extension
+    # property breaking, mid-rollout context compaction). The
+    # ``progress_labels`` argument is kept only as a positional fallback for
+    # turns where the prefix tokenisation didn't match (rare, e.g. when the
+    # model emits an alt phrasing); the fallback indexes into the full
+    # rollout list at the sample-local turn index and is best-effort.
+    detected_labels: list[str] = []
+    detected_prefix_spans: list[tuple[int, int] | None] = []
+    for span_start, span_end in turn_spans:
+        hit = _detect_label_prefix(completion_ids, span_start, span_end, spec)
+        if hit is None:
+            detected_labels.append(DEFAULT_LABEL)
+            detected_prefix_spans.append(None)
+        else:
+            lbl, ps, pe = hit
+            detected_labels.append(lbl if lbl in LABEL_VALUE else DEFAULT_LABEL)
+            detected_prefix_spans.append((ps, pe))
+
+    # Best-effort fallback for turns where token-level detection failed:
+    # if the env-side parser caught the label for this turn index, prefer
+    # that over the NEUTRAL default. This only helps when the sample
+    # contains the first N turns of the rollout in order; for
+    # later-in-rollout samples it'll typically be wrong but those turns
+    # already have a token-level detection (the prefix is identical
+    # regardless of turn index), so this branch is rare.
+    labels: list[str] = []
+    for i, lbl in enumerate(detected_labels):
+        if lbl != DEFAULT_LABEL or detected_prefix_spans[i] is not None:
+            labels.append(lbl)
+        elif i < len(progress_labels) and progress_labels[i] in LABEL_VALUE:
+            labels.append(progress_labels[i])
+        else:
+            labels.append(DEFAULT_LABEL)
 
     # Mask only the literal ``PROGRESS_LAST_TURN=<label>`` token span so no
     # gradient flows through the label characters (anti-hacking belt to
-    # mass-preservation's suspenders). The label sits mid-turn (between
-    # </think> and the tool call) so we mask just the prefix tokens — not
-    # the whole span up to it. Turn spans are intentionally NOT recomputed
-    # here: the masking creates tiny mask=False holes inside each turn but
-    # we still want to count those positions toward the turn's length so
-    # the surrounding reasoning + tool-call tokens carry the per-turn
-    # multiplier consistently.
+    # mass-preservation's suspenders). Turn spans are intentionally NOT
+    # recomputed here: the masking creates tiny mask=False holes inside each
+    # turn but we still want to count those positions toward the turn's
+    # length so the surrounding reasoning + tool-call tokens carry the
+    # per-turn multiplier consistently.
     n_masked = 0
     if spec.mask_label_tokens:
         new_mask = list(completion_mask)
-        for span_start, span_end in turn_spans:
-            hit = _detect_label_prefix(completion_ids, span_start, span_end, spec)
-            if hit is None:
+        for pref in detected_prefix_spans:
+            if pref is None:
                 continue
-            _, prefix_start, prefix_end = hit
+            prefix_start, prefix_end = pref
             for pos in range(prefix_start, prefix_end):
                 if new_mask[pos]:
                     new_mask[pos] = False
