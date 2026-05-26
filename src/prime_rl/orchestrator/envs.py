@@ -21,7 +21,12 @@ from prime_rl.utils.logger import ProgressTracker, get_logger
 from prime_rl.utils.monitor import get_monitor
 from prime_rl.utils.utils import capitalize
 
-REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
+# `_progress_labels` carries one self-judged label per assistant turn when an
+# env (currently only hai-desktop-env) opts into the inline progress-scoring
+# protocol. It is consumed by `prime_rl.orchestrator.self_judge` to convert the
+# scalar GRPO advantage into per-turn token advantages. Other envs leave it
+# unset and the column is simply absent from their RolloutOutput.
+REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args", "_progress_labels"]
 
 
 class Env:

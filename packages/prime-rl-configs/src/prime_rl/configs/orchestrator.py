@@ -862,6 +862,47 @@ class TeacherRolloutModelConfig(BaseConfig):
     ] = ModelConfig()
 
 
+class SelfJudgeConfig(BaseModel):
+    """Per-turn LLM self-judging credit assignment.
+
+    The policy emits `PROGRESS_LAST_TURN=<REGRESS|NEUTRAL|PROGRESS|ACHIEVED>`
+    at the start of every assistant turn (system-prompt enforced by the env).
+    These labels are translated into per-token advantage multipliers with a
+    sign-aware linear formula `w[t] = 1 + alpha * label_value[t] * sign(adv)`,
+    rescaled to preserve total token-advantage mass per rollout. Anti-hacking
+    is by construction: uniform labels normalise to multiplier 1.0 (no signal),
+    so only differential labelling across turns within a rollout creates per-step
+    credit. Optionally masks the label-prefix tokens from loss so no gradient
+    flows through them.
+    """
+
+    alpha: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Per-turn weight magnitude. With alpha=0.3 a PROGRESS turn gets "
+                "weight 1.3, REGRESS 0.7 in succ rollouts (flipped in fail). "
+                "Smaller values stay closer to the scalar baseline; larger values "
+                "concentrate gradient on labelled turns. Empirically 0.2-0.4."
+            ),
+        ),
+    ] = 0.3
+
+    mask_label_tokens: Annotated[
+        bool,
+        Field(
+            description=(
+                "When True, mask the literal `PROGRESS_LAST_TURN=<label>\\n` "
+                "token prefix from the loss so no policy gradient shapes the "
+                "labelling distribution. Combined with token-mass preservation "
+                "this eliminates self-rewarding hack paths."
+            ),
+        ),
+    ] = True
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -923,6 +964,24 @@ class OrchestratorConfig(BaseConfig):
 
     # The advantage configuration
     advantage: AdvantageConfig | None = DefaultAdvantageConfig()
+
+    # Per-turn LLM self-judging (see prime_rl.orchestrator.self_judge). When
+    # set, the orchestrator converts the env's per-turn progress labels into
+    # per-token advantages with token-mass preservation. Activates only when
+    # rollouts also carry `_progress_labels` from the environment; envs that
+    # do not opt in remain on the scalar GRPO baseline.
+    self_judge: Annotated[
+        SelfJudgeConfig | None,
+        Field(
+            description=(
+                "Optional LLM self-judging credit-assignment knob. When set, "
+                "the per-turn progress labels emitted by the policy itself are "
+                "translated into per-token advantage multipliers (with token-mass "
+                "preservation so uniform labels reduce to the scalar baseline). "
+                "Set to None to fall back to scalar GRPO advantages."
+            ),
+        ),
+    ] = None
 
     # Rollout filters (monitor by default, enforce optionally)
     filters: list[FilterConfig] = [GibberishFilterConfig(), RepetitionFilterConfig(), ZeroAdvantageFilterConfig()]

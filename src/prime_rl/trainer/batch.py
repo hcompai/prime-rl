@@ -11,7 +11,20 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
-    advantages = [training_example.advantage] * len(input_ids)
+    # Per-token advantage: if the orchestrator attached `completion_advantages`
+    # (e.g. via self-judging credit assignment), use them verbatim for the
+    # completion span. Prompt tokens always get the scalar advantage (they are
+    # loss-masked anyway, so the value is cosmetic but must match `input_ids` len).
+    completion_advs = training_example.completion_advantages
+    if completion_advs is not None:
+        if len(completion_advs) != len(training_example.completion_ids):
+            raise ValueError(
+                f"completion_advantages length {len(completion_advs)} != "
+                f"completion_ids length {len(training_example.completion_ids)}"
+            )
+        advantages = [training_example.advantage] * len(training_example.prompt_ids) + list(completion_advs)
+    else:
+        advantages = [training_example.advantage] * len(input_ids)
     position_ids = list(range(len(input_ids)))
     mm_token_type_ids = training_example.mm_token_type_ids
 

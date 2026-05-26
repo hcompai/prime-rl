@@ -41,6 +41,11 @@ from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
 from prime_rl.orchestrator.envs import EvalEnv, EvalEnvs, TrainEnvs
 from prime_rl.orchestrator.filters import apply_filters, setup_filters
 from prime_rl.orchestrator.scheduler import Scheduler
+from prime_rl.orchestrator.self_judge import (
+    SelfJudgeSpec,
+    attach_self_judge_advantages,
+    resolve_self_judge_spec,
+)
 from prime_rl.orchestrator.utils import (
     compute_teacher_logprobs,
     get_weight_dir,
@@ -191,6 +196,21 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Build rollout filters
     rollout_filters = setup_filters(config.filters, vocab_size=tokenizer.vocab_size)
+
+    # Pre-resolve the self-judging spec (tokenises the per-label prefix strings
+    # once) when the run opts in. Stays None for default runs; envs that don't
+    # opt in just leave `_progress_labels` unset and the spec is never consulted.
+    self_judge_spec: SelfJudgeSpec | None = None
+    if config.self_judge is not None:
+        self_judge_spec = resolve_self_judge_spec(
+            tokenizer,
+            alpha=config.self_judge.alpha,
+            mask_label_tokens=config.self_judge.mask_label_tokens,
+        )
+        logger.info(
+            f"Self-judging credit assignment enabled (alpha={config.self_judge.alpha}, "
+            f"mask_label_tokens={config.self_judge.mask_label_tokens})"
+        )
 
     # Load environments
     logger.info("Loading training environments")
@@ -543,17 +563,34 @@ async def orchestrate(config: OrchestratorConfig):
         rollout_samples_per_rollout: list[int] = []
         num_prefill_tokens = 0
         num_decode_tokens = 0
+        # Aggregated self-judge stats for this batch (logged below).
+        self_judge_stats: dict[str, list[float]] = {}
         for rollout, samples in zip(train_rollouts, results):
             rollout_prefill_tokens = 0
             rollout_decode_tokens = 0
             if samples is None:
                 samples = []
             rollout_samples_per_rollout.append(len(samples))
+            progress_labels = rollout.get("_progress_labels") if self_judge_spec is not None else None
             for sample in samples:
                 sample.advantage = rollout["advantage"]
                 sample.reward = rollout["reward"]
                 if config.use_sft_loss:
                     sample.sft_loss = True
+                # Per-turn self-judged credit assignment. Mutates sample in place
+                # (sets completion_advantages and, when enabled, prunes label-prefix
+                # tokens from completion_mask). Runs AFTER advantage is set because
+                # the multiplier sign depends on it.
+                if self_judge_spec is not None and progress_labels:
+                    stats = attach_self_judge_advantages(
+                        sample,
+                        progress_labels,
+                        sample.advantage,
+                        self_judge_spec,
+                    )
+                    if stats is not None:
+                        for k, v in stats.items():
+                            self_judge_stats.setdefault(k, []).append(float(v))
                 sample_decode_tokens = sum(sample.completion_mask)
                 sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens
                 rollout_decode_tokens += sample_decode_tokens
@@ -762,6 +799,18 @@ async def orchestrate(config: OrchestratorConfig):
             env_filter_df = filter_df.loc[env_df.index]
             for name in filter_df.columns:
                 to_log[f"filters/{env}/{name}"] = env_filter_df[name].astype(float).mean()
+
+        # Self-judging credit-assignment summary (only present when the run
+        # opted in AND at least one rollout carried per-turn labels).
+        if self_judge_stats:
+            for key, values in self_judge_stats.items():
+                if not values:
+                    continue
+                to_log[f"self_judge/{key}_mean"] = sum(values) / len(values)
+                if "max" in key:
+                    to_log[f"self_judge/{key}_max"] = max(values)
+                if "min" in key:
+                    to_log[f"self_judge/{key}_min"] = min(values)
 
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
