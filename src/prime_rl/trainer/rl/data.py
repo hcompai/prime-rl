@@ -6,7 +6,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-from prime_rl.configs.trainer import FakeDataLoaderConfig
+from prime_rl.configs.trainer import FakeDataLoaderConfig, TokenBoostConfig
 from prime_rl.trainer.rl.packer import BasePacker, setup_packer
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
@@ -157,6 +157,7 @@ class DataLoader:
         pad_to_multiple_of: int,
         tokenizer: PreTrainedTokenizer,
         config: TransportConfig,
+        token_boost: TokenBoostConfig | None = None,
     ):
         self.world = get_world()
 
@@ -168,6 +169,7 @@ class DataLoader:
                 transport_config=config,
                 pad_to_multiple_of=pad_to_multiple_of,
                 start_step=start_step,
+                token_boost=token_boost,
             )
 
         non_dp_world_size = self.world.world_size // dp_world_size

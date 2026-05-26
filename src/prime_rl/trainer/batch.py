@@ -1,17 +1,98 @@
 import copy
+from dataclasses import dataclass
 
 from prime_rl.transport.types import MicroBatch, TrainingSample
 
 
-def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch:
+@dataclass(frozen=True)
+class TokenBoostSpec:
+    """Resolved token-boost parameters for `prepare_sample`.
+
+    The packer resolves the open/close marker token strings to integer IDs
+    once at startup (via `tokenizer.convert_tokens_to_ids`) and passes the
+    resulting spec to every `prepare_sample` call.
+
+    `open_id` / `close_id` may be None when the model's tokenizer doesn't
+    expose these as special tokens (e.g. non-Qwen3, or structured-output
+    mode without `<tool_call>`). In that case the boost is a no-op.
+    """
+
+    open_id: int | None
+    close_id: int | None
+    boost: float
+
+
+def _compute_completion_weights(
+    completion_ids: list[int],
+    completion_mask: list[bool],
+    spec: TokenBoostSpec,
+) -> list[float]:
+    """Return a per-completion-token weight vector with preserved total mass.
+
+    Tokens inside the [open_id, close_id] span get `spec.boost`; others get
+    1.0. The full vector is then rescaled so the sum of weights over
+    trainable (mask=True) tokens equals the trainable token count — same
+    total advantage mass as the unweighted broadcast, just redistributed.
+
+    Behavior:
+      * spec.boost == 1.0 → returns all-ones (true no-op, no rescale).
+      * spec.open_id / spec.close_id is None → returns all-ones (graceful
+        fallback when the tokenizer lacks the markers).
+      * span never closes (e.g. truncated rollout) → all tokens after the
+        open marker stay boosted; mass-preservation rescale still applies.
+    """
+    n = len(completion_ids)
+    if spec.boost == 1.0 or spec.open_id is None or spec.close_id is None:
+        return [1.0] * n
+
+    raw: list[float] = [0.0] * n
+    in_span = False
+    for i, tid in enumerate(completion_ids):
+        # Include both the open and close markers themselves in the span so
+        # the gradient sees them as "decision-adjacent" tokens — emitting the
+        # open marker IS already a decision (committing to a tool call).
+        if tid == spec.open_id:
+            in_span = True
+        raw[i] = spec.boost if in_span else 1.0
+        if tid == spec.close_id and in_span:
+            in_span = False
+
+    trainable_mass = sum(w for w, m in zip(raw, completion_mask) if m)
+    n_trainable = sum(1 for m in completion_mask if m)
+    if trainable_mass <= 0 or n_trainable == 0:
+        return raw  # nothing trainable, scale would be undefined
+    scale = n_trainable / trainable_mass
+    return [w * scale for w in raw]
+
+
+def prepare_sample(
+    training_example: TrainingSample,
+    seq_len: int,
+    token_boost: TokenBoostSpec | None = None,
+) -> MicroBatch:
     """
     Prepare a problem for sequence packing training.
     Tokenize and prepare tensors.
+
+    When ``token_boost`` is provided and active (boost != 1.0, marker IDs
+    resolved), per-completion-token advantages are multiplied by a weight
+    vector that emphasizes tokens inside the configured span (e.g. tool
+    calls). Total advantage mass per rollout is preserved.
     """
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
-    advantages = [training_example.advantage] * len(input_ids)
+    if token_boost is not None:
+        completion_weights = _compute_completion_weights(
+            training_example.completion_ids,
+            training_example.completion_mask,
+            token_boost,
+        )
+        prompt_advantages = [training_example.advantage] * len(training_example.prompt_ids)
+        completion_advantages = [training_example.advantage * w for w in completion_weights]
+        advantages = prompt_advantages + completion_advantages
+    else:
+        advantages = [training_example.advantage] * len(input_ids)
     position_ids = list(range(len(input_ids)))
     mm_token_type_ids = training_example.mm_token_type_ids
 
@@ -206,6 +287,7 @@ def prepare_batch(
     idxs: list[int],
     num_loras: int,
     pad_to_multiple_of: int = 1,
+    token_boost: TokenBoostSpec | None = None,
 ) -> list[list[MicroBatch]]:
     """
     Prepare a batch of problems for each GPU. Each batch is a list of micro batches.
@@ -216,7 +298,9 @@ def prepare_batch(
     a text-only batch, the all-gather will hang. We separate micro batches by modality
     and distribute them so that at each step index, all ranks see the same modality.
     """
-    all_samples = [(idx, prepare_sample(rollout, seq_len)) for idx, rollout in zip(idxs, rollouts)]
+    all_samples = [
+        (idx, prepare_sample(rollout, seq_len, token_boost=token_boost)) for idx, rollout in zip(idxs, rollouts)
+    ]
 
     micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
     micro_batches = [pad_micro_batch(micro_batch, pad_to_multiple_of) for micro_batch in micro_batches]

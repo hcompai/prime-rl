@@ -7,7 +7,8 @@ from collections import deque
 
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-from prime_rl.trainer.batch import prepare_batch
+from prime_rl.configs.trainer import TokenBoostConfig
+from prime_rl.trainer.batch import TokenBoostSpec, prepare_batch
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.transport import (
     MicroBatch,
@@ -19,6 +20,31 @@ from prime_rl.transport import (
 )
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.pathing import get_rollout_dir
+
+
+def _resolve_token_boost(
+    config: TokenBoostConfig | None,
+    tokenizer: PreTrainedTokenizer,
+    logger,
+) -> TokenBoostSpec | None:
+    """Resolve open/close marker strings to token IDs once at packer init."""
+    if config is None or config.boost == 1.0:
+        return None
+    unk_id = tokenizer.unk_token_id
+    open_id = tokenizer.convert_tokens_to_ids(config.open_token)
+    close_id = tokenizer.convert_tokens_to_ids(config.close_token)
+    if open_id is None or open_id == unk_id or close_id is None or close_id == unk_id:
+        logger.warning(
+            "TokenBoostConfig: tokenizer has no special tokens for "
+            f"open={config.open_token!r} (id={open_id}) close={config.close_token!r} (id={close_id}). "
+            "Token boost disabled."
+        )
+        return None
+    logger.info(
+        f"TokenBoostConfig active: boost={config.boost} on tokens "
+        f"between {config.open_token} (id={open_id}) and {config.close_token} (id={close_id})"
+    )
+    return TokenBoostSpec(open_id=int(open_id), close_id=int(close_id), boost=float(config.boost))
 
 TIMEOUT_SECONDS = 0.1
 WATCHDOG_TIMEOUT_SECONDS = 1800  # 30 minutes
@@ -33,6 +59,7 @@ class BasePacker(ABC):
         tokenizer: PreTrainedTokenizer,
         config: TransportConfig,
         start_step: int = 0,
+        token_boost: TokenBoostConfig | None = None,
     ):
         self.logger = get_logger()
         self.multi_run_manager = get_multi_run_manager()
@@ -40,6 +67,7 @@ class BasePacker(ABC):
         self.seq_len = seq_len
         self.pad_to_multiple_of = pad_to_multiple_of
         self.tokenizer = tokenizer
+        self.token_boost = _resolve_token_boost(token_boost, tokenizer, self.logger)
         self.receiver = setup_training_batch_receiver(config)
         shutil.rmtree(get_rollout_dir(self.multi_run_manager.output_dir), ignore_errors=True)
         self.sender: MicroBatchSender = setup_micro_batch_sender(
@@ -85,8 +113,11 @@ class SinglePacker(BasePacker):
         tokenizer: PreTrainedTokenizer,
         config: TransportConfig,
         start_step: int = 0,
+        token_boost: TokenBoostConfig | None = None,
     ):
-        super().__init__(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, config, start_step)
+        super().__init__(
+            dp_world_size, seq_len, pad_to_multiple_of, tokenizer, config, start_step, token_boost=token_boost
+        )
         assert self.multi_run_manager.max_runs == 1, "SinglePacker only supports one run"
 
     def pack(self):
@@ -110,6 +141,7 @@ class SinglePacker(BasePacker):
             num_train_workers=self.dp_world_size,
             idxs=[0] * len(batch.examples),
             num_loras=self.multi_run_manager.max_runs,
+            token_boost=self.token_boost,
         )
 
         self.sender.send(micro_batch_grid)
@@ -124,8 +156,11 @@ class MultiPacker(BasePacker):
         tokenizer: PreTrainedTokenizer,
         config: TransportConfig,
         start_step: int = 0,
+        token_boost: TokenBoostConfig | None = None,
     ):
-        super().__init__(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, config, start_step)
+        super().__init__(
+            dp_world_size, seq_len, pad_to_multiple_of, tokenizer, config, start_step, token_boost=token_boost
+        )
         # Per-run buffer: stores (TrainingSample, step) tuples
         self.buffers: list[deque[tuple[TrainingSample, int]]] = [
             deque() for _ in range(self.multi_run_manager.max_runs)
@@ -327,6 +362,7 @@ class MultiPacker(BasePacker):
                 num_train_workers=self.dp_world_size,
                 idxs=[run_idx] * len(run_samples),
                 num_loras=self.multi_run_manager.max_runs,
+                token_boost=self.token_boost,
             )
             # Merge into combined grid
             for worker_idx, worker_batches in enumerate(run_micro_batch_grid):
@@ -342,9 +378,14 @@ def setup_packer(
     tokenizer: PreTrainedTokenizer,
     transport_config: TransportConfig,
     start_step: int = 0,
+    token_boost: TokenBoostConfig | None = None,
 ) -> BasePacker:
     multi_run_manager = get_multi_run_manager()
     if multi_run_manager.max_runs == 1:
-        return SinglePacker(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, transport_config, start_step)
+        return SinglePacker(
+            dp_world_size, seq_len, pad_to_multiple_of, tokenizer, transport_config, start_step, token_boost=token_boost
+        )
     else:
-        return MultiPacker(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, transport_config, start_step)
+        return MultiPacker(
+            dp_world_size, seq_len, pad_to_multiple_of, tokenizer, transport_config, start_step, token_boost=token_boost
+        )

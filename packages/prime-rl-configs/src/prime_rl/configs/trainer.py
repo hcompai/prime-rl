@@ -678,6 +678,47 @@ class CustomLossConfig(BaseModel):
 LossConfig: TypeAlias = Annotated[DefaultLossConfig | SFTLossConfig | CustomLossConfig, Field(discriminator="type")]
 
 
+class TokenBoostConfig(BaseModel):
+    """Token-level advantage reweighting for agentic RL.
+
+    Multiplies the per-token advantage by ``boost`` for tokens that fall
+    between an open/close marker (e.g. ``<tool_call>...</tool_call>``), and
+    rescales every other completion token so the total per-rollout advantage
+    mass is preserved. With mass preservation the effective learning rate is
+    unchanged — the gradient is just redistributed onto the boosted span.
+
+    Designed to concentrate the GRPO gradient on the *decision tokens* (tool
+    name, args, coordinates) instead of letting it diffuse across the long
+    reasoning prose that surrounds them. Empirically the tokens that
+    discriminate good vs bad rollouts in a tool-using agent are the ~20-50
+    tokens inside ``<tool_call>...</tool_call>``, not the ~10k tokens of
+    thought text — boosting them gives short rollouts the same signal density
+    as a math RL setup where the whole completion is the answer.
+
+    Detection uses tokenizer special-token IDs: the open/close strings must
+    resolve to single token IDs via ``tokenizer.convert_tokens_to_ids``.
+    Qwen3+ chat templates emit ``<tool_call>`` / ``</tool_call>`` as special
+    tokens, so detection is exact and 0-cost. For models without these
+    special tokens the resolver yields the UNK id and the boost is silently
+    disabled (no-op fallback).
+
+    Set ``boost=1.0`` to disable without removing the section.
+    """
+
+    open_token: Annotated[
+        str,
+        Field(description="Special token string that opens the boosted span."),
+    ] = "<tool_call>"
+    close_token: Annotated[
+        str,
+        Field(description="Special token string that closes the boosted span."),
+    ] = "</tool_call>"
+    boost: Annotated[
+        float,
+        Field(ge=0, description="Multiplier applied to advantages inside the span (1.0 = no-op)."),
+    ] = 1.0
+
+
 class FakeDataLoaderConfig(BaseConfig):
     """Configures a fake data loader sampling random micro batches for debugging."""
 
@@ -752,6 +793,13 @@ class TrainerConfig(BaseConfig):
 
     # The loss configuration
     loss: LossConfig = DefaultLossConfig()
+
+    # Per-token advantage boost on tool-call spans. Optional; when None the
+    # trainer reverts to the default uniform per-token advantage broadcast.
+    token_boost: Annotated[
+        TokenBoostConfig | None,
+        Field(description="Reweight advantages on tool-call spans (see TokenBoostConfig). None disables."),
+    ] = None
 
     # The optimizer configuration
     optim: OptimizerConfig = AdamWConfig()
