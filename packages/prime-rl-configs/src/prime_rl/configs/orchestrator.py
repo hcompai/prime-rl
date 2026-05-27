@@ -902,6 +902,20 @@ class SelfJudgeConfig(BaseModel):
         ),
     ] = True
 
+    flip_false_achieved: Annotated[
+        bool,
+        Field(
+            description=(
+                "When True, re-interpret ACHIEVED → REGRESS for credit "
+                "assignment in failed rollouts. The rollout-level eval is "
+                "ground truth: ACHIEVED claimed on a failed rollout is a "
+                "high-confidence mistake, not a near-success. Without this "
+                "the sign-aware weighting protects false-ACHIEVED turns "
+                "(weight ~0 = least blame), reinforcing over-confidence."
+            ),
+        ),
+    ] = True
+
 
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""

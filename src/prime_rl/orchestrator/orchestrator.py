@@ -206,10 +206,12 @@ async def orchestrate(config: OrchestratorConfig):
             tokenizer,
             alpha=config.self_judge.alpha,
             mask_label_tokens=config.self_judge.mask_label_tokens,
+            flip_false_achieved=config.self_judge.flip_false_achieved,
         )
         logger.info(
             f"Self-judging credit assignment enabled (alpha={config.self_judge.alpha}, "
-            f"mask_label_tokens={config.self_judge.mask_label_tokens})"
+            f"mask_label_tokens={config.self_judge.mask_label_tokens}, "
+            f"flip_false_achieved={config.self_judge.flip_false_achieved})"
         )
 
     # Load environments

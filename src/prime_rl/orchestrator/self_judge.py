@@ -96,6 +96,14 @@ class SelfJudgeSpec:
     # preceding-context tokenisations (BPE merges depend on the boundary).
     label_prefix_token_ids: dict[str, list[list[int]]]
     mask_label_tokens: bool = True
+    # When True, re-interpret ACHIEVED → REGRESS in failed rollouts. The
+    # rollout-level eval is ground truth — when the model claimed ACHIEVED
+    # and the eval rejected, that turn was a high-confidence mistake, not
+    # a near-success. Without this flip the sign-aware weighting *protects*
+    # false-ACHIEVED turns from negative gradient (weight ~0), reinforcing
+    # over-confidence. See rollout forensics in iter-10 commit message:
+    # 27% of ACHIEVED-emitting rollouts actually failed in iter-8.
+    flip_false_achieved: bool = True
 
 
 def _encode_label_prefix_variants(tokenizer: "PreTrainedTokenizerBase", label: str) -> list[list[int]]:
@@ -135,6 +143,7 @@ def resolve_self_judge_spec(
     tokenizer: "PreTrainedTokenizerBase",
     alpha: float,
     mask_label_tokens: bool = True,
+    flip_false_achieved: bool = True,
 ) -> SelfJudgeSpec:
     """Pre-compute label-prefix token sequences once at orchestrator start."""
     prefix_ids = {label: _encode_label_prefix_variants(tokenizer, label) for label in LABEL_VALUE}
@@ -142,6 +151,7 @@ def resolve_self_judge_spec(
         alpha=alpha,
         label_prefix_token_ids=prefix_ids,
         mask_label_tokens=mask_label_tokens,
+        flip_false_achieved=flip_false_achieved,
     )
 
 
@@ -302,7 +312,21 @@ def attach_self_judge_advantages_to_rollout(
         }
 
     adv_sign = 1.0 if scalar_advantage >= 0 else -1.0
-    raw_weights = [1.0 + spec.alpha * LABEL_VALUE[lbl] * adv_sign for _si, _idx, lbl, _pref in flat]
+    # Demote ACHIEVED → REGRESS in failed rollouts: a model that claimed
+    # task completion which the eval rejected made a high-confidence
+    # mistake on that turn, not a near-success. Without this, the
+    # sign-aware formula gives ACHIEVED-in-fail near-zero weight (least
+    # blame), reinforcing over-confidence — see rollout forensics in
+    # iter-10. Track the count for wandb diagnostics.
+    n_flipped_achieved = 0
+    effective_labels: list[str] = []
+    for _si, _idx, lbl, _pref in flat:
+        if spec.flip_false_achieved and adv_sign < 0 and lbl == "ACHIEVED":
+            effective_labels.append("REGRESS")
+            n_flipped_achieved += 1
+        else:
+            effective_labels.append(lbl)
+    raw_weights = [1.0 + spec.alpha * LABEL_VALUE[lbl] * adv_sign for lbl in effective_labels]
     raw_weights = [max(0.05, w) for w in raw_weights]
 
     weighted_sum = sum(w * L for w, L in zip(raw_weights, span_lens))
@@ -335,6 +359,7 @@ def attach_self_judge_advantages_to_rollout(
         "n_samples": len(samples),
         "n_masked_tokens": n_masked,
         "n_token_detected_labels": n_detected,
+        "n_flipped_achieved": n_flipped_achieved,
         "label_count_REGRESS": label_counts["REGRESS"],
         "label_count_NEUTRAL": label_counts["NEUTRAL"],
         "label_count_PROGRESS": label_counts["PROGRESS"],
