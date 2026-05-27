@@ -95,6 +95,21 @@ def _patch_qwen3_5_moe_conversion_mapping():
     register_checkpoint_conversion_mapping("qwen3_5_moe", [], overwrite=True)
 
 
+def _patch_qwen3_5_text_conversion_mapping():
+    """Clear qwen3_5_text mapping so its `^model.language_model` -> `model` rule isn't
+    lifted via submodule recursion to the full VLM, where its reverse would mis-nest
+    `model.visual.*` under `model.language_model.visual.*` at save time.
+
+    Must run AFTER `_patch_qwen3_5_moe_conversion_mapping`, which snapshots `qwen3_5_text`
+    to seed `qwen3_5_moe_text`.
+
+    Remove once the pinned transformers commit fixes this.
+    """
+    from transformers.conversion_mapping import register_checkpoint_conversion_mapping
+
+    register_checkpoint_conversion_mapping("qwen3_5_text", [], overwrite=True)
+
+
 def _patch_qwen3_5_text_position_ids():
     """Fix Qwen3.5 passing 3D MRoPE position_ids to decoder layers instead of 2D text_position_ids.
 
@@ -425,6 +440,7 @@ def get_model(
     if "Qwen3.5" in config.name or "qwen3_5" in config.name.lower():
         _patch_qwen3_5_text_position_ids()
         _patch_qwen3_5_moe_conversion_mapping()
+        _patch_qwen3_5_text_conversion_mapping()
         _patch_qwen3_5_linear_attn_varlen()
 
     model_config = cast(
@@ -464,6 +480,7 @@ def get_model(
     if getattr(model_config, "model_type", "").startswith("qwen3_5_moe"):
         _patch_qwen3_5_text_position_ids()
         _patch_qwen3_5_moe_conversion_mapping()
+        _patch_qwen3_5_text_conversion_mapping()
         _patch_qwen3_5_linear_attn_varlen()
     for subconfig_key in getattr(model_config, "sub_configs", {}):
         subconfig = getattr(model_config, subconfig_key, None)
