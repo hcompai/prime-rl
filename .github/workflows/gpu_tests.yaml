@@ -18,7 +18,10 @@ jobs:
       image: pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel
       options: --gpus all
     timeout-minutes: 45
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    # Skip on forks: `vm` is a self-hosted runner only registered on
+    # PrimeIntellect-ai/prime-rl. Without the gate the job sits queued for the
+    # full 24h Actions limit on every fork PR / push.
+    if: github.repository == 'PrimeIntellect-ai/prime-rl' && (github.event_name == 'push' || github.event.pull_request.draft == false)
     steps:
       - name: Install Git
         run: |
@@ -55,7 +58,9 @@ jobs:
       image: pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel
       options: --gpus all
     timeout-minutes: 60
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    # Skip on forks: `vm` / `4xa6000` are self-hosted runners only registered
+    # on PrimeIntellect-ai/prime-rl.
+    if: github.repository == 'PrimeIntellect-ai/prime-rl' && (github.event_name == 'push' || github.event.pull_request.draft == false)
     strategy:
       fail-fast: false
       matrix:

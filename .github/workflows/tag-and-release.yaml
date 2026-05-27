@@ -19,7 +19,10 @@ on:
 
 jobs:
   auto-tag-on-main:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Skip on forks: this job creates `v*` tags and publishes draft GitHub
+    # Releases, which only exist on PrimeIntellect-ai/prime-rl. On forks it
+    # fails because no draft release matches.
+    if: github.repository == 'PrimeIntellect-ai/prime-rl' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -115,7 +118,7 @@ jobs:
 
   release-from-auto-tag:
     needs: auto-tag-on-main
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.auto-tag-on-main.outputs.created == 'true'
+    if: github.repository == 'PrimeIntellect-ai/prime-rl' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.auto-tag-on-main.outputs.created == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -128,7 +131,7 @@ jobs:
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
   tag-and-release:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'PrimeIntellect-ai/prime-rl' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
