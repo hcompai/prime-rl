@@ -9,6 +9,12 @@ jobs:
   cuda:
     name: Push CUDA image to Docker
     runs-on: image-builder
+    # Skip on forks: `image-builder` is a self-hosted runner registered only on
+    # PrimeIntellect-ai/prime-rl, and the job publishes to the upstream
+    # `primeintellect/prime-rl` Docker Hub repo (DOCKER_HUB_* secrets are not
+    # provisioned on the fork). Without this gate every push to fork main is
+    # cancelled by the 24h queue timeout.
+    if: github.repository == 'PrimeIntellect-ai/prime-rl'
     steps:
       - name: Remove unnecessary packages
         run: |

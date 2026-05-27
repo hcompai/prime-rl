@@ -17,6 +17,10 @@ jobs:
     discover-experiments:
         name: Discover experiments
         runs-on: ubuntu-latest
+        # Nightly run-experiment uses `research-cluster`, a self-hosted runner
+        # only registered on PrimeIntellect-ai/prime-rl. Short-circuit on forks
+        # so the scheduled run doesn't queue indefinitely.
+        if: github.repository == 'PrimeIntellect-ai/prime-rl'
 
         outputs:
             matrix: ${{ steps.build-matrix.outputs.matrix }}

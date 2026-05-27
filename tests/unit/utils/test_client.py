@@ -6,7 +6,12 @@ import httpx
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
-from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients
+from prime_rl.utils.client import (
+    LORA_LOAD_READ_TIMEOUT_S,
+    _is_retryable_lora_error,
+    load_lora_adapter,
+    setup_clients,
+)
 
 
 def test_is_retryable_lora_error_returns_true_for_404():
@@ -45,7 +50,7 @@ def test_load_lora_adapter_succeeds_on_first_attempt():
     mock_client.post.assert_called_once_with(
         "/load_lora_adapter",
         json={"lora_name": "test-lora", "lora_path": "/test/path"},
-        timeout=httpx.Timeout(connect=10.0, read=30.0, write=60.0, pool=10.0),
+        timeout=httpx.Timeout(connect=10.0, read=LORA_LOAD_READ_TIMEOUT_S, write=60.0, pool=10.0),
     )
 
 
