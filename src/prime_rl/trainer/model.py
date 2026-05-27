@@ -71,27 +71,38 @@ def pre_download_model(model_name: str) -> None:
     )
 
 
-def _patch_qwen3_5_moe_conversion_mapping():
-    """Fix Qwen3.5 MoE conversion mapping incorrectly applying qwen2_moe expert weight splitting.
+def _patch_qwen3_5_conversion_mapping():
+    """Fix Qwen3.5 conversion mapping bugs that corrupt weight checkpoints.
 
-    Qwen3.5 MoE stores expert weights as fused 3D tensors natively in the checkpoint
-    (e.g. experts.gate_up_proj [num_experts, 2*intermediate, hidden]). The upstream mapping
-    incorrectly maps qwen3_5_moe → qwen2_moe, which assumes per-expert 2D checkpoint weights,
-    causing revert_weight_conversion to produce wrong shapes during weight broadcasting.
+    Two distinct upstream issues:
+    1. The `qwen3_5_text` rule (`^model.language_model` -> `model`) targets a standalone
+       Qwen3_5TextModel load, but `get_model_conversion_mapping` lifts it via submodule
+       recursion to the full Qwen3_5ForConditionalGeneration. Its reverse then fires at
+       save time on in-memory keys that already have `model.language_model.*`, producing
+       checkpoints with extra `language_model.` prefixes and `model.visual.*` mis-nested
+       as `model.language_model.visual.*` — unloadable by vLLM.
+    2. `qwen3_5_moe` is aliased to `qwen2_moe` in `_MODEL_TO_CONVERSION_PATTERN`, but
+       Qwen3.5 MoE stores expert weights as fused 3D tensors natively (e.g.
+       experts.gate_up_proj [num_experts, 2*intermediate, hidden]), so applying
+       qwen2_moe's per-expert 2D split produces wrong shapes during weight broadcasting.
 
-    Remove once the pinned transformers commit fixes this.
+    Remove once the pinned transformers commit fixes these.
     """
     from transformers.conversion_mapping import (
         get_checkpoint_conversion_mapping,
         register_checkpoint_conversion_mapping,
     )
 
-    # qwen3_5_moe_text: keep only the qwen3_5_text renaming, remove qwen2_moe expert conversion
+    # qwen3_5_moe_text: keep only the qwen3_5_text renaming, drop the qwen2_moe expert conversion.
+    # Must snapshot qwen3_5_text BEFORE clearing it below.
     qwen3_5_text_mapping = get_checkpoint_conversion_mapping("qwen3_5_text")
     if qwen3_5_text_mapping is not None:
         register_checkpoint_conversion_mapping("qwen3_5_moe_text", qwen3_5_text_mapping, overwrite=True)
 
-    # qwen3_5_moe: remove the qwen2_moe fallback entirely
+    # Bug 1: clear so the rule isn't lifted to the full VLM via submodule recursion.
+    register_checkpoint_conversion_mapping("qwen3_5_text", [], overwrite=True)
+
+    # Bug 2: remove the qwen2_moe fallback entirely.
     register_checkpoint_conversion_mapping("qwen3_5_moe", [], overwrite=True)
 
 
@@ -424,7 +435,7 @@ def get_model(
 
     if "Qwen3.5" in config.name or "qwen3_5" in config.name.lower():
         _patch_qwen3_5_text_position_ids()
-        _patch_qwen3_5_moe_conversion_mapping()
+        _patch_qwen3_5_conversion_mapping()
         _patch_qwen3_5_linear_attn_varlen()
 
     model_config = cast(
@@ -463,7 +474,7 @@ def get_model(
     # Fallback Qwen3.5 patch detection from loaded config model_type
     if getattr(model_config, "model_type", "").startswith("qwen3_5_moe"):
         _patch_qwen3_5_text_position_ids()
-        _patch_qwen3_5_moe_conversion_mapping()
+        _patch_qwen3_5_conversion_mapping()
         _patch_qwen3_5_linear_attn_varlen()
     for subconfig_key in getattr(model_config, "sub_configs", {}):
         subconfig = getattr(model_config, subconfig_key, None)
