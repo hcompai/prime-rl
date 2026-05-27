@@ -916,6 +916,25 @@ class SelfJudgeConfig(BaseModel):
         ),
     ] = True
 
+    clamp_fail_dampening: Annotated[
+        bool,
+        Field(
+            description=(
+                "When True, clamp per-turn weights to >= 1.0 in failed "
+                "rollouts. The sign-aware formula was designed assuming "
+                "labels are honest: PROGRESS-in-fail = 'this action was "
+                "locally OK but the rollout failed elsewhere' → soft-"
+                "landing weight 0.5x. Empirically labels are systematically "
+                "optimistic — the dominant failure mode (typing wrong path "
+                "into text field) gets labelled PROGRESS and the 0.5x "
+                "weight then *protects* the broken strategy from blame. "
+                "Clamping removes dampening so positive labels in fail "
+                "rollouts get full scalar blame; only REGRESS turns get "
+                "amplified."
+            ),
+        ),
+    ] = True
+
 
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""

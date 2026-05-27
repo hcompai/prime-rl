@@ -207,11 +207,13 @@ async def orchestrate(config: OrchestratorConfig):
             alpha=config.self_judge.alpha,
             mask_label_tokens=config.self_judge.mask_label_tokens,
             flip_false_achieved=config.self_judge.flip_false_achieved,
+            clamp_fail_dampening=config.self_judge.clamp_fail_dampening,
         )
         logger.info(
             f"Self-judging credit assignment enabled (alpha={config.self_judge.alpha}, "
             f"mask_label_tokens={config.self_judge.mask_label_tokens}, "
-            f"flip_false_achieved={config.self_judge.flip_false_achieved})"
+            f"flip_false_achieved={config.self_judge.flip_false_achieved}, "
+            f"clamp_fail_dampening={config.self_judge.clamp_fail_dampening})"
         )
 
     # Load environments

@@ -104,6 +104,22 @@ class SelfJudgeSpec:
     # over-confidence. See rollout forensics in iter-10 commit message:
     # 27% of ACHIEVED-emitting rollouts actually failed in iter-8.
     flip_false_achieved: bool = True
+    # When True, clamp per-turn weights to ≥ 1.0 in failed rollouts. The
+    # original sign-aware formula assumed honest labels: a PROGRESS-labelled
+    # turn in a fail rollout is "the model believes this action was OK but
+    # the rollout failed overall" → soft-landing weight 0.5. But iter-8
+    # rollout forensics showed labels are *systematically optimistic*: the
+    # dominant failure mode (`write_desktop` typing "Desktop" instead of
+    # "/home/hai/Desktop") was reliably labelled PROGRESS by the model
+    # because the post-action screenshot looked right. Dampening blame on
+    # that turn (0.5 + mass-renorm → ~0.6×) let the broken strategy
+    # persist across 43 steps with no learning. Clamping to ≥ 1.0 keeps
+    # the *amplification* of REGRESS turns (the one signal we can trust:
+    # "model thinks it screwed up AND it did") but removes the dampening,
+    # so positive labels in fail rollouts get full scalar blame instead
+    # of reduced blame. Combined with `flip_false_achieved`, ACHIEVED in
+    # a fail rollout becomes REGRESS-equivalent (amplified blame).
+    clamp_fail_dampening: bool = True
 
 
 def _encode_label_prefix_variants(tokenizer: "PreTrainedTokenizerBase", label: str) -> list[list[int]]:
@@ -144,6 +160,7 @@ def resolve_self_judge_spec(
     alpha: float,
     mask_label_tokens: bool = True,
     flip_false_achieved: bool = True,
+    clamp_fail_dampening: bool = True,
 ) -> SelfJudgeSpec:
     """Pre-compute label-prefix token sequences once at orchestrator start."""
     prefix_ids = {label: _encode_label_prefix_variants(tokenizer, label) for label in LABEL_VALUE}
@@ -152,6 +169,7 @@ def resolve_self_judge_spec(
         label_prefix_token_ids=prefix_ids,
         mask_label_tokens=mask_label_tokens,
         flip_false_achieved=flip_false_achieved,
+        clamp_fail_dampening=clamp_fail_dampening,
     )
 
 
@@ -328,6 +346,16 @@ def attach_self_judge_advantages_to_rollout(
             effective_labels.append(lbl)
     raw_weights = [1.0 + spec.alpha * LABEL_VALUE[lbl] * adv_sign for lbl in effective_labels]
     raw_weights = [max(0.05, w) for w in raw_weights]
+    # Clamp dampening in fail rollouts: positive labels (PROGRESS) in
+    # failed rollouts are *systematically optimistic* (the model thinks
+    # the action helped because the screenshot looks like progress, but
+    # the rollout-level eval said no). The original soft-landing weight
+    # 0.5× *protected* those turns from blame — the exact opposite of
+    # what we want when the labels are unreliable. After clamping, only
+    # REGRESS turns get amplified (1.5×) and everything else gets the
+    # scalar baseline (1.0×) before mass-preservation.
+    if spec.clamp_fail_dampening and adv_sign < 0:
+        raw_weights = [max(1.0, w) for w in raw_weights]
 
     weighted_sum = sum(w * L for w, L in zip(raw_weights, span_lens))
     if weighted_sum <= 0:
