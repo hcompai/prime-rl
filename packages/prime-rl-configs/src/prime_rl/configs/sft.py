@@ -337,11 +337,6 @@ class SFTConfig(BaseConfig):
                 "pack_function='stack' is incompatible with VLM training "
                 "(variable image-tensor shapes). Use 'cat' or 'mm_cat'."
             )
-        if self.loss_impl not in ("torch", "liger"):
-            raise ValueError(
-                "VLM SFT with fused CE (liger_fused / quack_fused) has not "
-                "been validated. Use loss_impl='torch' or 'liger'."
-            )
         if self.val is not None and self.val.data.pack_function == "stack":
             raise ValueError(
                 "Validation pack_function='stack' is incompatible with VLM training."
