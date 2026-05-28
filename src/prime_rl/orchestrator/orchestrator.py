@@ -7,6 +7,11 @@ import tomli_w
 
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before transitive import
 from prime_rl.orchestrator.advantage import compute_advantages
+from prime_rl.orchestrator.apost_step_judge import (
+    ApostStepJudgeSpec,
+    attach_apost_step_advantages_to_rollout,
+    resolve_apost_step_judge_spec,
+)
 from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
 from prime_rl.orchestrator.inference_metrics import InferenceMetricsCollector
@@ -191,6 +196,24 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Build rollout filters
     rollout_filters = setup_filters(config.filters, vocab_size=tokenizer.vocab_size)
+
+    # A-posteriori step-judge credit assignment. Resolved once at startup when
+    # the run opts in. Stays None for default runs; envs that don't opt in
+    # leave `_apost_step_scores` unset and the spec is never consulted even
+    # if it was built.
+    apost_step_judge_spec: ApostStepJudgeSpec | None = None
+    if config.apost_step_judge is not None:
+        apost_step_judge_spec = resolve_apost_step_judge_spec(
+            base=config.apost_step_judge.base,
+            completion_bonus=config.apost_step_judge.completion_bonus,
+            clamp_fail_dampening=config.apost_step_judge.clamp_fail_dampening,
+        )
+        logger.info(
+            f"A-posteriori step-judge credit assignment enabled "
+            f"(base={config.apost_step_judge.base}, "
+            f"completion_bonus={config.apost_step_judge.completion_bonus}, "
+            f"clamp_fail_dampening={config.apost_step_judge.clamp_fail_dampening})"
+        )
 
     # Load environments
     logger.info("Loading training environments")
@@ -543,6 +566,8 @@ async def orchestrate(config: OrchestratorConfig):
         rollout_samples_per_rollout: list[int] = []
         num_prefill_tokens = 0
         num_decode_tokens = 0
+        # Aggregated apost step-judge stats for this batch (logged below).
+        apost_step_judge_stats: dict[str, list[float]] = {}
         for rollout, samples in zip(train_rollouts, results):
             rollout_prefill_tokens = 0
             rollout_decode_tokens = 0
@@ -554,6 +579,25 @@ async def orchestrate(config: OrchestratorConfig):
                 sample.reward = rollout["reward"]
                 if config.use_sft_loss:
                     sample.sft_loss = True
+            # A-posteriori per-step credit assignment. Operates on ALL samples
+            # of the rollout together so mass preservation pools spans across
+            # samples (extension breaks → multi-sample rollouts otherwise get
+            # a no-op single-span renorm per sample). Mutates each sample's
+            # `completion_advantages` in place.
+            if apost_step_judge_spec is not None and samples:
+                step_scores = rollout.get("_apost_step_scores") or []
+                completion_bonus_applies = bool(rollout.get("_apost_judge_completion_bonus", False))
+                stats = attach_apost_step_advantages_to_rollout(
+                    samples,
+                    list(step_scores),
+                    rollout["advantage"],
+                    completion_bonus_applies,
+                    apost_step_judge_spec,
+                )
+                if stats is not None:
+                    for k, v in stats.items():
+                        apost_step_judge_stats.setdefault(k, []).append(float(v))
+            for sample in samples:
                 sample_decode_tokens = sum(sample.completion_mask)
                 sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens
                 rollout_decode_tokens += sample_decode_tokens
@@ -762,6 +806,14 @@ async def orchestrate(config: OrchestratorConfig):
             env_filter_df = filter_df.loc[env_df.index]
             for name in filter_df.columns:
                 to_log[f"filters/{env}/{name}"] = env_filter_df[name].astype(float).mean()
+
+        # A-posteriori step-judge per-rollout stats — mean across rollouts in
+        # this batch. Empty when the feature is off (apost_step_judge_spec is
+        # None) or no rollout produced stats this batch.
+        if apost_step_judge_stats:
+            for k, vals in apost_step_judge_stats.items():
+                if vals:
+                    to_log[f"apost_step_judge/{k}"] = sum(vals) / len(vals)
 
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
