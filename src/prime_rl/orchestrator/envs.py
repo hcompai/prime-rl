@@ -21,7 +21,12 @@ from prime_rl.utils.logger import ProgressTracker, get_logger
 from prime_rl.utils.monitor import get_monitor
 from prime_rl.utils.utils import capitalize
 
-REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
+# `_apost_step_scores` and `_apost_judge_completion_bonus` carry per-assistant-turn
+# scores (and the answer-closing bonus flag) when an env opts into the
+# a-posteriori step-judge credit-assignment protocol. Consumed by
+# `prime_rl.orchestrator.apost_step_judge`. Other envs leave them unset and
+# the columns are simply absent from their RolloutOutput.
+REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args", "_apost_step_scores", "_apost_judge_completion_bonus"]
 
 
 class Env:

@@ -14,6 +14,12 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     teacher_logprobs: list[float] | None = None
     advantage: float | None = None
     reward: float | None = None
+    # Optional per-completion-token advantage override. When set, the trainer uses
+    # these values verbatim instead of broadcasting `advantage` across all tokens.
+    # Length must equal len(completion_ids). Populated by per-step credit-assignment
+    # mechanisms (e.g. a-posteriori LLM step judge). See
+    # ``orchestrator/apost_step_judge.py``.
+    completion_advantages: list[float] | None = None
 
     # Multimodal fields (Qwen3-VL) — pixel_values stored as raw float32 bytes for efficient serialization
     pixel_values: bytes | None = None

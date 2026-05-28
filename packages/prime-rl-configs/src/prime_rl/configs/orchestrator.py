@@ -862,6 +862,62 @@ class TeacherRolloutModelConfig(BaseConfig):
     ] = ModelConfig()
 
 
+class ApostStepJudgeConfig(BaseModel):
+    """A-posteriori per-step LLM judge credit assignment.
+
+    An external judge (e.g. Claude Sonnet 4.6) reads the finished episode
+    trace post-hoc and emits a continuous score in ``[0, 1]`` per assistant
+    turn (the fraction of N generic criteria satisfied). The env writes the
+    list into ``state["_apost_step_scores"]`` and a completion-bonus boolean
+    into ``state["_apost_judge_completion_bonus"]``; this hook converts them
+    into per-token advantage multipliers via a sign-aware linear formula
+    with token-mass preservation. See ``orchestrator/apost_step_judge.py``.
+
+    Sibling of ``self_judge``: same downstream gradient effect, but the
+    judge is external (no in-loop policy format), continuous (no 4-bucket
+    bottleneck), and hindsight-aware (sees the whole trajectory at once).
+    """
+
+    base: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Floor weight in success rollouts: a step scoring 0 still gets "
+                "base × scalar advantage. Protects useful tokens from judge "
+                "false-negatives. base=1.0 disables per-step weighting; "
+                "base=0.0 multiplies the worst-scoring steps by 0 pre-renorm. "
+                "Empirically 0.3-0.5."
+            ),
+        ),
+    ] = 0.5
+
+    completion_bonus: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            description=(
+                "Multiplicative bonus on the raw weight of the answer-closing "
+                "turn when the task scored as success. raw_w[T] *= (1 + bonus). "
+                "Adds 'close the deal' pressure on top of M/N. 0.0 disables."
+            ),
+        ),
+    ] = 0.5
+
+    clamp_fail_dampening: Annotated[
+        bool,
+        Field(
+            description=(
+                "When True, clamp per-step weights to >= 1.0 in failed rollouts. "
+                "Without the clamp, high-score steps in failed rollouts would be "
+                "blamed more than low-score ones — the wrong direction. Mirrors "
+                "the same flag on SelfJudgeConfig."
+            ),
+        ),
+    ] = True
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -923,6 +979,26 @@ class OrchestratorConfig(BaseConfig):
 
     # The advantage configuration
     advantage: AdvantageConfig | None = DefaultAdvantageConfig()
+
+    # A-posteriori per-step LLM judge credit assignment (see
+    # prime_rl.orchestrator.apost_step_judge). When set, the orchestrator
+    # converts the env's per-step M/N scores into per-token advantages with
+    # token-mass preservation. Activates only when rollouts also carry
+    # `_apost_step_scores` from the environment; envs that do not opt in
+    # remain on the scalar GRPO baseline.
+    apost_step_judge: Annotated[
+        ApostStepJudgeConfig | None,
+        Field(
+            description=(
+                "Optional a-posteriori step-judge credit-assignment knob. When set, "
+                "the per-step scores written into state['_apost_step_scores'] by the "
+                "env (typically populated from an external Claude / GPT judge) are "
+                "translated into per-token advantage multipliers (with token-mass "
+                "preservation so uniform scores reduce to the scalar baseline). "
+                "Set to None to fall back to scalar GRPO advantages."
+            ),
+        ),
+    ] = None
 
     # Rollout filters (monitor by default, enforce optionally)
     filters: list[FilterConfig] = [GibberishFilterConfig(), RepetitionFilterConfig(), ZeroAdvantageFilterConfig()]
